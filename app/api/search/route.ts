@@ -28,7 +28,9 @@ function assertImageIdentity(urls: string[], code: string, name: string) {
   if (!expectedName || !urls.length) throw new Error("无法核对影像档案姓名，已停止查询。请检查超声号和报告单姓名。");
   for (const value of urls) {
     const url = new URL(value);
-    const folder = decodeURIComponent(url.pathname.split("/").slice(-2, -1)[0] || "");
+    const pathParts = url.pathname.split("/").filter(Boolean);
+    const pacsIndex = pathParts.findIndex(part => part.toLowerCase() === "pacs");
+    const folder = decodeURIComponent(pacsIndex >= 0 ? pathParts[pacsIndex + 1] || "" : "");
     const parts = folder.split("_");
     const folderCode = parts.shift() || "";
     if (/^\d{8}$/.test(parts.at(-1) || "")) parts.pop();

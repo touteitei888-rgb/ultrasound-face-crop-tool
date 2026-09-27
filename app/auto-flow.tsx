@@ -116,7 +116,7 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
     const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
-    return candidate.score >= .68 && candidate.frontal >= .58 && faceWidthPixels >= Math.max(180, width * .22) && faceWidthPixels <= maxCropWidth * .98;
+    return candidate.score >= .55 && candidate.frontal >= .40 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(120, width * .16);
   });
   const jpgs = eligible.filter(candidate => /^\.?jpe?g$/i.test(candidate.ext));
   const gifs = eligible.filter(candidate => /^\.?gif$/i.test(candidate.ext));
