@@ -154,12 +154,18 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
   return bestPair(gifs.length ? gifs : other);
 }
 
-async function crop(candidate: Awaited<ReturnType<typeof snapshot>>): Promise<Crop> {
+function maxCropWidthFor(candidate: FaceCandidate) {
+  const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
+  const safeTop = Math.ceil(height * .14), safeBottom = Math.floor(height * .96), safeLeft = Math.floor(width * .10), safeRight = Math.ceil(width * .98);
+  return Math.floor(Math.min(width, (safeBottom - safeTop) * .75, safeRight - safeLeft) / 3) * 3;
+}
+
+async function crop(candidate: FaceCandidate, commonWidth?: number): Promise<Crop> {
   const image = candidate.image, width = image.naturalWidth, height = image.naturalHeight;
   const safeTop = Math.ceil(height * .14), safeBottom = Math.floor(height * .96), safeLeft = Math.floor(width * .10), safeRight = Math.ceil(width * .98);
   const maxCropWidth = Math.floor(Math.min(width, (safeBottom - safeTop) * .75, safeRight - safeLeft) / 3) * 3;
   const targetWidth = candidate.faceWidth * width / 160 / .84;
-  const cropWidth = Math.floor(Math.min(targetWidth, maxCropWidth) / 3) * 3;
+  const cropWidth = commonWidth || Math.floor(Math.min(targetWidth, maxCropWidth) / 3) * 3;
   const cropHeight = cropWidth * 4 / 3;
   if (cropWidth < 3) throw new Error("影像分辨率不足，无法裁成 3:4。");
   const cx = clamp(candidate.cx, safeLeft + cropWidth / 2, safeRight - cropWidth / 2);
@@ -218,7 +224,8 @@ async function runPhoto(file: File | undefined, manualCode: string, manualName: 
   const selected = chooseFaceCandidates(candidates);
   if (!selected.length) throw new Error("没有找到能完整显示小朋友人脸的彩色影像；黑白平扫图或角度不合适的图片已跳过。");
   const crops: Crop[] = [];
-  for (const candidate of selected) crops.push(await crop(candidate));
+  const commonWidth = selected.length > 1 ? Math.min(...selected.map(maxCropWidthFor)) : undefined;
+  for (const candidate of selected) crops.push(await crop(candidate, commonWidth));
   setStatus("正脸截图已生成，正在保存到本机…");
   await downloadZip(code, name, crops);
   setResult({ code, name, crops });
