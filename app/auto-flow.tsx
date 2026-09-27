@@ -138,17 +138,13 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     const jpgPair = bestPair(jpgs);
     if (jpgPair.length === 2) return jpgPair;
     const supplements = gifs.length ? gifs : other, primary = jpgPair[0];
-    const matched = supplements.filter(candidate => widthGap(primary, candidate) <= Math.log(1.5));
-    if (!matched.length) return jpgPair;
-    const supplement = matched.reduce((best, candidate) => pairValue(primary, candidate) > pairValue(primary, best) ? candidate : best, matched[0]);
+    const supplement = supplements.reduce((best, candidate) => pairValue(primary, candidate) > pairValue(primary, best) ? candidate : best, supplements[0]);
     return [primary, supplement];
   }
   if (jpgs.length === 1) {
     const supplements = gifs.length ? gifs : other;
     if (!supplements.length) return jpgs;
-    const matched = supplements.filter(candidate => widthGap(jpgs[0], candidate) <= Math.log(1.5));
-    if (!matched.length) return jpgs;
-    const supplement = matched.reduce((best, candidate) => pairValue(jpgs[0], candidate) > pairValue(jpgs[0], best) ? candidate : best, matched[0]);
+    const supplement = supplements.reduce((best, candidate) => pairValue(jpgs[0], candidate) > pairValue(jpgs[0], best) ? candidate : best, supplements[0]);
     return [jpgs[0], supplement];
   }
   return bestPair(gifs.length ? gifs : other);
