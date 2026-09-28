@@ -115,7 +115,7 @@ function analyze(image: HTMLImageElement) {
     const i = (y * sw + x) * 4, r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
     if (r > 48 && g > 28 && b > 10 && r > g * 1.06 && g > b * 1.02 && r - b > 18) { mask[y * sw + x] = 1; warmCount++; }
   }
-  const empty = { score: 0, frontal: 0, cx: width * .5, cy: height * .42, faceWidth: 0, faceHeight: 0, colorPixels: warmCount, clarity };
+  const empty = { score: 0, frontal: 0, cx: width * .5, cy: height * .42, faceWidth: 0, faceHeight: 0, colorPixels: warmCount, clarity, featureScore: 0, faceConfidence: 0 };
   if (warmCount < 80) return empty;
   let largest: { count: number; points: Int32Array; minX: number; maxX: number; minY: number; maxY: number } | null = null;
   for (let seed = 0; seed < mask.length; seed++) {
@@ -152,7 +152,23 @@ function analyze(image: HTMLImageElement) {
   const frontal = leftCount + rightCount ? 2 * both / (leftCount + rightCount) : 0;
   const balance = leftCount + rightCount ? 2 * Math.min(leftCount, rightCount) / (leftCount + rightCount) : 0;
   const coverage = rows ? rowCount / rows : 0;
-  return { score: frontal * .54 + coverage * .22 + balance * .14 + clarity * .10, frontal, cx: cx / sw * width, cy: cy / sh * height, faceWidth, faceHeight, colorPixels: warmCount, clarity };
+  let darkLeft = 0, darkRight = 0;
+  const featureTop = Math.round(largest.minY + faceHeight * .08), featureBottom = Math.round(largest.minY + faceHeight * .68);
+  const featureLeft = Math.round(faceMinX + faceWidth * .14), featureRight = Math.round(faceMaxX - faceWidth * .14);
+  for (let y = featureTop; y <= featureBottom; y++) for (let x = featureLeft; x <= featureRight; x++) {
+    const i = (y * sw + x) * 4, luminance = pixels[i] * .299 + pixels[i + 1] * .587 + pixels[i + 2] * .114;
+    if (luminance >= 62) continue;
+    let warmNeighbors = 0;
+    for (let ny = Math.max(0, y - 2); ny <= Math.min(sh - 1, y + 2); ny++) for (let nx = Math.max(0, x - 2); nx <= Math.min(sw - 1, x + 2); nx++) warmNeighbors += largestMask[ny * sw + nx];
+    if (warmNeighbors < 4) continue;
+    if (x < cx) darkLeft++; else darkRight++;
+  }
+  const darkTotal = darkLeft + darkRight;
+  const darkBalance = darkTotal ? 2 * Math.min(darkLeft, darkRight) / darkTotal : 0;
+  const darkPresence = Math.min(1, darkTotal / 32);
+  const featureScore = darkBalance * darkPresence;
+  const faceConfidence = frontal * .40 + coverage * .16 + balance * .10 + clarity * .16 + featureScore * .18;
+  return { score: frontal * .48 + coverage * .20 + balance * .10 + clarity * .10 + featureScore * .12, frontal, cx: cx / sw * width, cy: cy / sh * height, faceWidth, faceHeight, colorPixels: warmCount, clarity, featureScore, faceConfidence };
 }
 
 async function snapshot(asset: Asset): Promise<FaceCandidate[]> {
@@ -181,6 +197,8 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
   const jpgs = eligible.filter(candidate => /^\.?jpe?g$/i.test(candidate.ext));
   const gifs = eligible.filter(candidate => /^\.?gif$/i.test(candidate.ext));
   const other = eligible.filter(candidate => !/^\.?jpe?g$/i.test(candidate.ext) && !/^\.?gif$/i.test(candidate.ext));
+  const strongJpgs = jpgs.filter(candidate => candidate.faceConfidence >= .44 && candidate.clarity >= .10);
+  const strongGifs = gifs.filter(candidate => candidate.faceConfidence >= .44 && candidate.clarity >= .10);
   const widthGap = (a: FaceCandidate, b: FaceCandidate) => Math.abs(Math.log((a.faceWidth * a.image.naturalWidth) / (b.faceWidth * b.image.naturalWidth)));
   const pairValue = (a: FaceCandidate, b: FaceCandidate) => (a.score + b.score) / 2 + (a.clarity + b.clarity) * .12 - widthGap(a, b) * .22;
   const bestPair = (pool: FaceCandidate[]) => {
@@ -194,22 +212,27 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     }
     return best || [pool.slice().sort((a, b) => b.score - a.score)[0]];
   };
-  if (jpgs.length >= 2) {
-    const jpgPair = bestPair(jpgs);
+  if (strongJpgs.length >= 2) {
+    const jpgPair = bestPair(strongJpgs);
     if (jpgPair.length === 2) return jpgPair;
-    const supplements = gifs.length ? gifs : other, primary = jpgPair[0];
+    const supplements = strongGifs.length ? strongGifs : other, primary = jpgPair[0];
+    if (!supplements.length) return jpgPair;
     const supplement = supplements.reduce((best, candidate) => pairValue(primary, candidate) > pairValue(primary, best) ? candidate : best, supplements[0]);
     return [primary, supplement];
   }
-  if (jpgs.length === 1) {
-    const supplements = gifs.length ? gifs : other;
-    if (!supplements.length) return jpgs;
+  if (strongJpgs.length === 1) {
+    const supplements = strongGifs.length ? strongGifs : other;
+    if (!supplements.length) return strongJpgs;
     const supplement = supplements
       .slice()
-      .sort((a, b) => pairValue(jpgs[0], b) - pairValue(jpgs[0], a))[0];
-    return [jpgs[0], supplement];
+      .sort((a, b) => pairValue(strongJpgs[0], b) - pairValue(strongJpgs[0], a))[0];
+    return [strongJpgs[0], supplement];
   }
-  return bestPair(gifs.length ? gifs : other);
+  if (strongGifs.length) return bestPair(strongGifs);
+  if (other.length) return bestPair(other);
+  // If the hospital returns no GIF, retain the best JPG rather than failing;
+  // a clearly non-face JPG is never selected when a usable GIF is available.
+  return bestPair(jpgs);
 }
 
 function maxCropWidthFor(candidate: FaceCandidate) {
