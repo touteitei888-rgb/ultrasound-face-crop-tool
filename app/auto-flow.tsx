@@ -240,10 +240,12 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     return {
       ...candidate,
-      cx: candidate.cx > width * .24 && candidate.cx < width * .76 ? candidate.cx : width * .52,
-      cy: candidate.cy > height * .22 && candidate.cy < height * .66 ? candidate.cy : height * .42,
-      faceWidth: 160 * .30,
-      faceHeight: 160 * .30,
+      // The raw JPG contains the complete ultrasound layout. For album output
+      // use the stable facial area, not the arm/placenta region beside it.
+      cx: width * .47,
+      cy: height * .45,
+      faceWidth: 160 * .24,
+      faceHeight: 160 * .24,
       frontal: Math.max(candidate.frontal, .28),
       score: Math.max(candidate.score, .42),
       faceConfidence: Math.max(candidate.faceConfidence, .32),
