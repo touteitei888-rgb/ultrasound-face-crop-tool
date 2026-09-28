@@ -225,22 +225,16 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     }
     return best || [pool.slice().sort((a, b) => b.score - a.score)[0]];
   };
-  if (strongJpgs.length >= 2) {
-    const jpgPair = bestPair(strongJpgs);
-    if (jpgPair.length === 2) return jpgPair;
-    const supplements = strongGifs.length ? strongGifs : other, primary = jpgPair[0];
-    if (!supplements.length) return jpgPair;
-    const supplement = supplements.reduce((best, candidate) => pairValue(primary, candidate) > pairValue(primary, best) ? candidate : best, supplements[0]);
-    return [primary, supplement];
-  }
-  if (strongJpgs.length === 1) {
-    const supplements = strongGifs.length ? strongGifs : other;
-    if (!supplements.length) return strongJpgs;
-    const supplement = supplements
-      .slice()
-      .sort((a, b) => pairValue(strongJpgs[0], b) - pairValue(strongJpgs[0], a))[0];
-    return [strongJpgs[0], supplement];
-  }
+  // JPG is always the first choice. Do not add a GIF beside a usable JPG:
+  // GIF is only a fallback for cases where all JPGs are unusable.
+  if (strongJpgs.length) return bestPair(strongJpgs);
+  const jpgFallback = candidates.filter(candidate => {
+    const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
+    const faceWidthPixels = candidate.faceWidth * width / 160;
+    const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
+    return /^\.?jpe?g$/i.test(candidate.ext) && candidate.colorPixels >= 80 && candidate.faceWidth >= 18 && candidate.score >= .30 && candidate.frontal >= .20 && candidate.faceConfidence >= .28 && candidate.clarity >= .04 && faceWidthPixels >= Math.max(90, width * .10) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .80;
+  });
+  if (jpgFallback.length) return bestPair(jpgFallback);
   if (strongGifs.length) return bestPair(strongGifs);
   if (other.length) return bestPair(other);
   // Some valid 3D ultrasound faces have soft edges or only a brief frontal
@@ -251,7 +245,7 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
     const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
-    return candidate.score >= .38 && candidate.frontal >= .28 && candidate.clarity >= .06 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(100, width * .14) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .74;
+    return !/^\.?jpe?g$/i.test(candidate.ext) && candidate.score >= .38 && candidate.frontal >= .28 && candidate.clarity >= .06 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(100, width * .14) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .74;
   });
   if (rescue.length) return bestPair(rescue);
   // Do not export a clearly non-face JPG just to fill the second slot.
@@ -329,7 +323,7 @@ async function runPhoto(file: File | undefined, manualCode: string, manualName: 
   setStatus(file ? `已识别/填写 ${code}，正在查询影像…` : `正在按超声号 ${code} 查询影像…`);
   const assets = await searchImages(code, name);
   if (!assets.length) throw new Error("没有找到这个超声号的影像，请检查报告单或稍后重试。");
-  setStatus(`找到 ${assets.length} 张影像，正在逐帧转换 JPG 并筛选清晰正脸…`);
+  setStatus(`找到 ${assets.length} 张影像，先筛选原始 JPG；只有 JPG 不可用时才逐帧转换 GIF…`);
   const candidates: FaceCandidate[] = [];
   for (const asset of assets) { try { candidates.push(...await snapshot(asset)); } catch { /* Skip unreadable images */ } }
   const selected = chooseFaceCandidates(candidates);
