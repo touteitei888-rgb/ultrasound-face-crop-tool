@@ -147,7 +147,31 @@ function analyze(image: HTMLImageElement) {
     sx += x; sy += y; pixelsInFace++; faceMinX = Math.min(faceMinX, x); faceMaxX = Math.max(faceMaxX, x);
   }
   if (pixelsInFace < 80 || faceMaxX - faceMinX < 18) return empty;
-  const cx = sx / pixelsInFace, cy = sy / pixelsInFace, faceWidth = faceMaxX - faceMinX + 1, faceHeight = faceBottom - largest.minY + 1;
+  // The largest warm component can contain an arm or placenta beside the
+  // face. Find the densest central horizontal window in the upper component
+  // instead of using the whole component centroid as the face position.
+  const rawFaceWidth = faceMaxX - faceMinX + 1;
+  const windowWidth = Math.max(18, Math.round(rawFaceWidth * .62));
+  const columnDensity = new Int32Array(sw);
+  for (const p of largest.points) {
+    const x = p % sw, y = Math.floor(p / sw);
+    if (y <= faceBottom) columnDensity[x]++;
+  }
+  let bestFaceStart = faceMinX, bestFaceDensity = -Infinity;
+  for (let start = faceMinX; start + windowWidth - 1 <= faceMaxX; start++) {
+    let density = 0;
+    for (let x = start; x < start + windowWidth; x++) density += columnDensity[x];
+    if (density > bestFaceDensity) { bestFaceDensity = density; bestFaceStart = start; }
+  }
+  faceMinX = bestFaceStart;
+  faceMaxX = bestFaceStart + windowWidth - 1;
+  let localSx = 0, localSy = 0, localPixels = 0;
+  for (const p of largest.points) {
+    const x = p % sw, y = Math.floor(p / sw);
+    if (y <= faceBottom && x >= faceMinX && x <= faceMaxX) { localSx += x; localSy += y; localPixels++; }
+  }
+  if (localPixels < 40) return empty;
+  const cx = localSx / localPixels, cy = localSy / localPixels, faceWidth = faceMaxX - faceMinX + 1, faceHeight = faceBottom - largest.minY + 1;
   let leftCount = 0, rightCount = 0, both = 0, rowCount = 0, rows = 0;
   for (let y = largest.minY; y <= faceBottom; y++) {
     let rowBoth = 0;
