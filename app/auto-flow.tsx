@@ -230,9 +230,8 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
   }
   if (strongGifs.length) return bestPair(strongGifs);
   if (other.length) return bestPair(other);
-  // If the hospital returns no GIF, retain the best JPG rather than failing;
-  // a clearly non-face JPG is never selected when a usable GIF is available.
-  return bestPair(jpgs);
+  // Do not export a clearly non-face JPG just to fill the second slot.
+  return [];
 }
 
 function maxCropWidthFor(candidate: FaceCandidate) {
