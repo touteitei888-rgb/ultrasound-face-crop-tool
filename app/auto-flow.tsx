@@ -8,7 +8,7 @@ type Crop = { dataUrl: string; width: number; height: number; bytes: number };
 type Worker = { recognize: (image: File) => Promise<{ data: { text: string; confidence: number } }>; terminate: () => Promise<void> };
 type FaceCandidate = ReturnType<typeof analyze> & { image: HTMLImageElement; ext: string; asset: Asset; frameIndex: number };
 type CaseResult = { code: string; name: string; crops: Crop[] };
-type SaveDirectory = { name: string; getDirectoryHandle: (name: string, options?: { create?: boolean }) => Promise<SaveDirectory>; getFileHandle: (name: string, options?: { create?: boolean }) => Promise<{ createWritable: () => Promise<{ write: (data: Uint8Array) => Promise<void>; close: () => Promise<void> }> }>; };
+type SaveDirectory = { name: string; queryPermission?: (options?: { mode?: "read" | "readwrite" }) => Promise<PermissionState>; requestPermission?: (options?: { mode?: "read" | "readwrite" }) => Promise<PermissionState>; getDirectoryHandle: (name: string, options?: { create?: boolean }) => Promise<SaveDirectory>; getFileHandle: (name: string, options?: { create?: boolean }) => Promise<{ createWritable: () => Promise<{ write: (data: Uint8Array) => Promise<void>; close: () => Promise<void> }> }>; };
 
 declare global {
   interface Window {
@@ -349,6 +349,8 @@ async function downloadZip(code: string, name: string, crops: Crop[]) {
 }
 
 async function saveCaseFolder(root: SaveDirectory, code: string, name: string, crops: Crop[]) {
+  const permission = root.queryPermission ? await root.queryPermission({ mode: "readwrite" }) : "granted";
+  if (permission !== "granted") throw new Error("保存目录权限已失效，请重新点击“选择保存目录”并允许写入。");
   const folder = await root.getDirectoryHandle(`${code} ${name}`, { create: true });
   for (let i = 0; i < crops.length; i++) {
     const handle = await folder.getFileHandle(`${i + 1}.png`, { create: true });
@@ -398,8 +400,11 @@ async function runPhoto(file: File | undefined, manualCode: string, manualName: 
   if (commonWidth < 120) throw new Error("合格正脸的可用范围太小，无法生成统一大小的相册照片。");
   for (const candidate of selected) crops.push(await crop(candidate, commonWidth));
   setStatus("正脸截图已生成，正在保存到本机…");
-  if (saveDirectory) await saveCaseFolder(saveDirectory, code, name, crops); else await downloadZip(code, name, crops);
-  setStatus(saveDirectory ? `完成。已保存到文件夹“${code} ${name}”。` : `完成。已下载“${code} ${name}.zip”，解压后包含 ${crops.length === 1 ? "一张合格人像图" : "两张合格人像图"}。`);
+  if (saveDirectory) {
+    try { await saveCaseFolder(saveDirectory, code, name, crops); setStatus(`完成。已保存到文件夹“${code} ${name}”。`); }
+    catch (error) { setStatus(error instanceof Error ? `${error.message} 已改为下载 ZIP。` : "保存目录不可用，已改为下载 ZIP。"); await downloadZip(code, name, crops); }
+  } else await downloadZip(code, name, crops);
+  if (!saveDirectory) setStatus(`完成。已下载“${code} ${name}.zip”，解压后包含 ${crops.length === 1 ? "一张合格人像图" : "两张合格人像图"}。`);
   return { code, name, crops };
 }
 
@@ -444,7 +449,7 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
       <h2 className="text-xl font-semibold">输入 1–10 组超声号和姓名</h2>
       <p className="mt-2 text-sm text-slate-600">每一行对应一个小朋友；空行会跳过。每组都会生成两张正脸预览。</p>
       <div className="mt-4 space-y-2">{batchRows.map((row,i)=><div key={i} className="grid grid-cols-[3rem_1fr_1fr] gap-2"><span className="pt-2 text-sm text-slate-500">{i+1}</span><input value={row.code} onChange={e=>setBatchRows(rows=>rows.map((r,j)=>j===i?{...r,code:e.target.value}:r))} inputMode="numeric" placeholder="超声号" className="rounded-lg border border-slate-300 px-3 py-2"/><input value={row.name} onChange={e=>setBatchRows(rows=>rows.map((r,j)=>j===i?{...r,name:e.target.value}:r))} placeholder="报告单中文姓名" className="rounded-lg border border-slate-300 px-3 py-2"/></div>)}</div>
-      <div className="mt-4 flex flex-wrap gap-3"><button type="button" disabled={batchBusy} onClick={runBatch} className="rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60">{batchBusy?"正在批量处理…":"开始批量处理"}</button><button type="button" onClick={async()=>{const picker=(window as Window & { showDirectoryPicker?: () => Promise<SaveDirectory> }).showDirectoryPicker;if(!picker){setStatus("请使用最新版 Chrome 或 Edge 才能直接保存文件夹。");return}try{setSaveDirectory(await picker());setStatus("已选择保存根目录。") }catch{setStatus("已取消选择保存目录，结果仍可下载 ZIP。")}}} className="rounded-lg border border-teal-700 px-4 py-2.5 text-sm font-semibold text-teal-800">{saveDirectory?`保存目录：${saveDirectory.name}`:"选择本机保存目录"}</button></div>
+      <div className="mt-4 flex flex-wrap gap-3"><button type="button" disabled={batchBusy} onClick={runBatch} className="rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60">{batchBusy?"正在批量处理…":"开始批量处理"}</button><button type="button" onClick={async()=>{const picker=(window as Window & { showDirectoryPicker?: (options?: {mode?:"read"|"readwrite"}) => Promise<SaveDirectory> }).showDirectoryPicker;if(!picker){setStatus("请使用最新版 Chrome 或 Edge 才能直接保存文件夹。");return}try{const handle=await picker({mode:"readwrite"});if(handle.requestPermission){const permission=await handle.requestPermission({mode:"readwrite"});if(permission!=="granted")throw new Error("没有获得写入权限")}setSaveDirectory(handle);setStatus("已选择保存根目录，批量结果会直接写入文件夹。") }catch(reason){setSaveDirectory(null);setStatus(reason instanceof Error?reason.message:"已取消选择保存目录，结果仍可下载 ZIP。")}}} className="rounded-lg border border-teal-700 px-4 py-2.5 text-sm font-semibold text-teal-800">{saveDirectory?`保存目录：${saveDirectory.name}`:"选择本机保存目录"}</button></div>
       <p className="mt-2 text-sm text-slate-500">请选择普通空文件夹或桌面上的新建文件夹，不要选择系统目录；程序会在里面自动创建“超声号 姓名”子文件夹。</p>
       <p aria-live="polite" className={`mt-5 rounded-lg px-4 py-3 text-sm ${error?"bg-red-50 text-red-700":"bg-slate-50 text-slate-700"}`}>{status}</p>
     </section>
