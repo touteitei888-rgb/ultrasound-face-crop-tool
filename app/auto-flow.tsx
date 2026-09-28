@@ -6,6 +6,7 @@ type Asset = { index: number; mime: string; ext: string; bytes: string };
 type Crop = { dataUrl: string; width: number; height: number; bytes: number };
 type Worker = { recognize: (image: File) => Promise<{ data: { text: string; confidence: number } }>; terminate: () => Promise<void> };
 type FaceCandidate = ReturnType<typeof analyze> & { image: HTMLImageElement; ext: string; asset: Asset; frameIndex: number };
+type CaseResult = { code: string; name: string; crops: Crop[] };
 
 declare global {
   interface Window {
@@ -194,8 +195,7 @@ async function searchImages(code: string, name: string): Promise<Asset[]> {
   return result.assets ?? [];
 }
 
-async function runPhoto(file: File | undefined, manualCode: string, manualName: string, setStatus: (text: string) => void, setResult: (value: { code: string; name: string; crops: Crop[] } | null) => void) {
-  setResult(null);
+async function runPhoto(file: File | undefined, manualCode: string, manualName: string, setStatus: (text: string) => void): Promise<CaseResult> {
   let fields: { code: string | null; name: string | null } = { code: null, name: null };
   if (file) {
     if (file.size > 20 * 1024 * 1024) throw new Error("报告照片超过 20 MB，请换一张较小的照片。");
@@ -224,27 +224,43 @@ async function runPhoto(file: File | undefined, manualCode: string, manualName: 
   for (const candidate of selected) crops.push(await crop(candidate, commonWidth));
   setStatus("正脸截图已生成，正在保存到本机…");
   await downloadZip(code, name, crops);
-  setResult({ code, name, crops });
   setStatus(`完成。已下载“${code} ${name}.zip”，解压后包含 ${crops.length === 1 ? "一张合格人像图" : "两张合格人像图"}。`);
+  return { code, name, crops };
 }
 
 export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
   const [status,setStatus]=useState("选好彩超报告单照片后自动处理；报告照片在浏览器本机识别。");
   const [error,setError]=useState(false);
-  const [result,setResult]=useState<{code:string;name:string;crops:Crop[]}|null>(null);
+  const [result,setResult]=useState<CaseResult|null>(null);
+  const [batchResults,setBatchResults]=useState<CaseResult[]>([]);
   const [busy,setBusy]=useState(false);
+  const [batchBusy,setBatchBusy]=useState(false);
   const input=useRef<HTMLInputElement>(null);
+  const batchInput=useRef<HTMLTextAreaElement>(null);
   const codeInput=useRef<HTMLInputElement>(null);
   const nameInput=useRef<HTMLInputElement>(null);
 
   async function handle(file?:File){
     if(busy||(!file&&!codeInput.current?.value.trim()))return;setBusy(true);setError(false);
-    try{await runPhoto(file,codeInput.current?.value??"",nameInput.current?.value??"",setStatus,setResult)}
+    try{setResult(await runPhoto(file,codeInput.current?.value??"",nameInput.current?.value??"",setStatus))}
     catch(reason){setError(true);setStatus(reason instanceof Error?reason.message:"处理失败，请重新拍摄报告单后再试。")}
     finally{setBusy(false);if(input.current)input.current.value=""}
   }
 
-  return <main className="mx-auto min-h-screen w-full max-w-3xl px-5 py-8 text-slate-900 sm:px-8 sm:py-12">
+  async function runBatch() {
+    if (batchBusy || busy) return;
+    const raw = batchInput.current?.value || "";
+    const rows = raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(0, 10);
+    const items = rows.map(line => { const m = line.match(/^(\d{6,20})[\s,，]+(.+)$/); return m ? { code: m[1], name: m[2].trim() } : null; }).filter(Boolean) as { code: string; name: string }[];
+    if (!items.length) { setStatus("请按每行“超声号 姓名”填写，最多 10 行。"); return; }
+    setBatchBusy(true); setBatchResults([]); setError(false);
+    const done: CaseResult[] = [];
+    try { for (let i = 0; i < items.length; i++) { setStatus(`正在处理第 ${i + 1}/${items.length} 组：${items[i].code}…`); done.push(await runPhoto(undefined, items[i].code, items[i].name, setStatus)); setBatchResults([...done]); } setStatus(`批量完成，共处理 ${done.length} 组。`); }
+    catch (reason) { setError(true); setStatus(reason instanceof Error ? reason.message : "批量处理中断。"); }
+    finally { setBatchBusy(false); }
+  }
+
+  return <main className="mx-auto min-h-screen w-full max-w-5xl px-5 py-8 text-slate-900 sm:px-8 sm:py-12">
     <header className="mb-8 flex items-start justify-between gap-5">
       <div><p className="mb-2 text-sm font-semibold tracking-wide text-teal-700">四维影像整理</p><h1 className="text-3xl font-semibold tracking-tight">上传报告，自动截正脸</h1><p className="mt-3 max-w-xl text-slate-600">先核对超声号和报告姓名，再从彩色影像中筛选完整人脸，自动居中裁成 3:4。</p></div>
       <a href={signOutHref} target="_top" className="shrink-0 rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50">退出</a>
@@ -263,6 +279,13 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
       <button type="button" disabled={busy} onClick={()=>handle()} className="mt-3 rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">按填写的信息查询并自动截图</button>
       <p className="mt-2 text-sm text-slate-500">如果照片识别失败，请手动填写超声号和报告姓名。两项与医院档案不一致时会停止查询。</p>
       <p aria-live="polite" className={`mt-5 rounded-lg px-4 py-3 text-sm ${error?"bg-red-50 text-red-700":"bg-slate-50 text-slate-700"}`}>{status}</p>
+    </section>
+    <section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
+      <h2 className="text-xl font-semibold">批量处理（最多 10 组）</h2>
+      <p className="mt-2 text-sm text-slate-600">每行填写“超声号 姓名”，例如：20260925012 刘佳。每组会单独查询并下载 ZIP，同时保留页面预览。</p>
+      <textarea ref={batchInput} rows={6} disabled={batchBusy} placeholder="20260925012 刘佳\n20260927014 赵香雨" className="mt-4 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-base outline-none focus:border-teal-600 focus:ring-2 focus:ring-teal-100" />
+      <button type="button" disabled={batchBusy||busy} onClick={runBatch} className="mt-3 rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60">{batchBusy?"正在批量处理…":"开始批量处理"}</button>
+      {batchResults.length>0&&<div className="mt-6 space-y-6">{batchResults.map(item=><article key={item.code} className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">{item.code} · {item.name}</h3><div className="mt-3 grid gap-4 sm:grid-cols-2">{item.crops.map((c,i)=><figure key={i} className="overflow-hidden rounded-lg border border-slate-200 bg-black"><img src={c.dataUrl} alt={`${item.code} 自动截图 ${i+1}`} className="aspect-[3/4] w-full object-contain"/><figcaption className="bg-white px-3 py-2 text-xs text-slate-600">截图 {i+1} · {c.width}×{c.height} · {Math.round(c.bytes/1024)} KB</figcaption></figure>)}</div></article>)}</div>}
     </section>
     {result&&<section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
       <h2 className="text-xl font-semibold">自动截图结果</h2>
