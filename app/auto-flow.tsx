@@ -8,6 +8,7 @@ type Crop = { dataUrl: string; width: number; height: number; bytes: number };
 type Worker = { recognize: (image: File) => Promise<{ data: { text: string; confidence: number } }>; terminate: () => Promise<void> };
 type FaceCandidate = ReturnType<typeof analyze> & { image: HTMLImageElement; ext: string; asset: Asset; frameIndex: number };
 type CaseResult = { code: string; name: string; crops: Crop[] };
+type SaveDirectory = { name: string; getDirectoryHandle: (name: string, options?: { create?: boolean }) => Promise<SaveDirectory>; getFileHandle: (name: string, options?: { create?: boolean }) => Promise<{ createWritable: () => Promise<{ write: (data: Uint8Array) => Promise<void>; close: () => Promise<void> }> }>; };
 
 declare global {
   interface Window {
@@ -347,6 +348,17 @@ async function downloadZip(code: string, name: string, crops: Crop[]) {
   document.body.appendChild(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
+async function saveCaseFolder(root: SaveDirectory, code: string, name: string, crops: Crop[]) {
+  const folder = await root.getDirectoryHandle(`${code} ${name}`, { create: true });
+  for (let i = 0; i < crops.length; i++) {
+    const handle = await folder.getFileHandle(`${i + 1}.png`, { create: true });
+    const writer = await handle.createWritable();
+    const raw = atob(decodeBase64(crops[i].dataUrl));
+    const bytes = new Uint8Array(raw.length); for (let j = 0; j < raw.length; j++) bytes[j] = raw.charCodeAt(j);
+    await writer.write(bytes); await writer.close();
+  }
+}
+
 async function searchImages(code: string, name: string): Promise<Asset[]> {
   const response = await fetch("/api/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, name }) });
   const result = await response.json() as { assets?: Asset[]; error?: string };
@@ -354,7 +366,7 @@ async function searchImages(code: string, name: string): Promise<Asset[]> {
   return result.assets ?? [];
 }
 
-async function runPhoto(file: File | undefined, manualCode: string, manualName: string, setStatus: (text: string) => void): Promise<CaseResult> {
+async function runPhoto(file: File | undefined, manualCode: string, manualName: string, setStatus: (text: string) => void, saveDirectory?: SaveDirectory): Promise<CaseResult> {
   let fields: { code: string | null; name: string | null } = { code: null, name: null };
   if (file) {
     if (file.size > 20 * 1024 * 1024) throw new Error("报告照片超过 20 MB，请换一张较小的照片。");
@@ -383,8 +395,8 @@ async function runPhoto(file: File | undefined, manualCode: string, manualName: 
   if (commonWidth < 120) throw new Error("合格正脸的可用范围太小，无法生成统一大小的相册照片。");
   for (const candidate of selected) crops.push(await crop(candidate, commonWidth));
   setStatus("正脸截图已生成，正在保存到本机…");
-  await downloadZip(code, name, crops);
-  setStatus(`完成。已下载“${code} ${name}.zip”，解压后包含 ${crops.length === 1 ? "一张合格人像图" : "两张合格人像图"}。`);
+  if (saveDirectory) await saveCaseFolder(saveDirectory, code, name, crops); else await downloadZip(code, name, crops);
+  setStatus(saveDirectory ? `完成。已保存到文件夹“${code} ${name}”。` : `完成。已下载“${code} ${name}.zip”，解压后包含 ${crops.length === 1 ? "一张合格人像图" : "两张合格人像图"}。`);
   return { code, name, crops };
 }
 
@@ -393,6 +405,7 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
   const [error,setError]=useState(false);
   const [result,setResult]=useState<CaseResult|null>(null);
   const [batchResults,setBatchResults]=useState<CaseResult[]>([]);
+  const [saveDirectory,setSaveDirectory]=useState<SaveDirectory|null>(null);
   const [busy,setBusy]=useState(false);
   const [batchBusy,setBatchBusy]=useState(false);
   const input=useRef<HTMLInputElement>(null);
@@ -402,7 +415,7 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
 
   async function handle(file?:File){
     if(busy||(!file&&!codeInput.current?.value.trim()))return;setBusy(true);setError(false);
-    try{setResult(await runPhoto(file,codeInput.current?.value??"",nameInput.current?.value??"",setStatus))}
+    try{setResult(await runPhoto(file,codeInput.current?.value??"",nameInput.current?.value??"",setStatus,saveDirectory??undefined))}
     catch(reason){setError(true);setStatus(reason instanceof Error?reason.message:"处理失败，请重新拍摄报告单后再试。")}
     finally{setBusy(false);if(input.current)input.current.value=""}
   }
@@ -415,7 +428,7 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
     if (!items.length) { setStatus("请按每行“超声号 姓名”填写，最多 10 行。"); return; }
     setBatchBusy(true); setBatchResults([]); setError(false);
     const done: CaseResult[] = [];
-    try { for (let i = 0; i < items.length; i++) { setStatus(`正在处理第 ${i + 1}/${items.length} 组：${items[i].code}…`); done.push(await runPhoto(undefined, items[i].code, items[i].name, setStatus)); setBatchResults([...done]); } setStatus(`批量完成，共处理 ${done.length} 组。`); }
+    try { for (let i = 0; i < items.length; i++) { setStatus(`正在处理第 ${i + 1}/${items.length} 组：${items[i].code}…`); done.push(await runPhoto(undefined, items[i].code, items[i].name, setStatus, saveDirectory??undefined)); setBatchResults([...done]); } setStatus(`批量完成，共处理 ${done.length} 组。`); }
     catch (reason) { setError(true); setStatus(reason instanceof Error ? reason.message : "批量处理中断。"); }
     finally { setBatchBusy(false); }
   }
@@ -437,7 +450,8 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
         <label className="block text-sm font-medium text-slate-700">报告单上的中文姓名<input ref={nameInput} autoComplete="off" placeholder="用于命名保存文件夹" className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-base outline-none focus:border-teal-600 focus:ring-2 focus:ring-teal-100"/></label>
       </div>
       <button type="button" disabled={busy} onClick={()=>handle()} className="mt-3 rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">按填写的信息查询并自动截图</button>
-      <p className="mt-2 text-sm text-slate-500">如果照片识别失败，请手动填写超声号和报告姓名。两项与医院档案不一致时会停止查询。</p>
+      <button type="button" onClick={async()=>{const picker=(window as Window & { showDirectoryPicker?: () => Promise<SaveDirectory> }).showDirectoryPicker;if(!picker){setStatus("当前浏览器不支持直接保存文件夹，请使用最新版 Chrome 或 Edge。");return}setSaveDirectory(await picker());setStatus("已选择本机保存根目录，后续结果会直接写入文件夹。")}} className="mt-3 ml-3 rounded-lg border border-teal-700 px-4 py-2.5 text-sm font-semibold text-teal-800">{saveDirectory?`已选择保存目录：${saveDirectory.name}`:"选择本机保存目录"}</button>
+      <p className="mt-2 text-sm text-slate-500">选择保存目录后，单组和批量结果会直接写入“超声号 姓名”文件夹；未选择时继续下载 ZIP。</p>
       <p aria-live="polite" className={`mt-5 rounded-lg px-4 py-3 text-sm ${error?"bg-red-50 text-red-700":"bg-slate-50 text-slate-700"}`}>{status}</p>
     </section>
     <section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
