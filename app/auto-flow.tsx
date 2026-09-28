@@ -184,9 +184,12 @@ function analyze(image: HTMLImageElement) {
   const frontal = leftCount + rightCount ? 2 * both / (leftCount + rightCount) : 0;
   const balance = leftCount + rightCount ? 2 * Math.min(leftCount, rightCount) / (leftCount + rightCount) : 0;
   const coverage = rows ? rowCount / rows : 0;
-  let darkLeft = 0, darkRight = 0;
+  let darkLeft = 0, darkRight = 0, eyeLeft = 0, eyeRight = 0, mouthCenter = 0;
   const featureTop = Math.round(largest.minY + faceHeight * .08), featureBottom = Math.round(largest.minY + faceHeight * .68);
   const featureLeft = Math.round(faceMinX + faceWidth * .14), featureRight = Math.round(faceMaxX - faceWidth * .14);
+  const eyeTop = Math.round(largest.minY + faceHeight * .18), eyeBottom = Math.round(largest.minY + faceHeight * .52);
+  const mouthTop = Math.round(largest.minY + faceHeight * .52), mouthBottom = Math.round(largest.minY + faceHeight * .82);
+  const mouthLeft = Math.round(faceMinX + faceWidth * .25), mouthRight = Math.round(faceMaxX - faceWidth * .25);
   for (let y = featureTop; y <= featureBottom; y++) for (let x = featureLeft; x <= featureRight; x++) {
     const i = (y * sw + x) * 4, luminance = pixels[i] * .299 + pixels[i + 1] * .587 + pixels[i + 2] * .114;
     if (luminance >= 62) continue;
@@ -194,13 +197,21 @@ function analyze(image: HTMLImageElement) {
     for (let ny = Math.max(0, y - 2); ny <= Math.min(sh - 1, y + 2); ny++) for (let nx = Math.max(0, x - 2); nx <= Math.min(sw - 1, x + 2); nx++) warmNeighbors += largestMask[ny * sw + nx];
     if (warmNeighbors < 4) continue;
     if (x < cx) darkLeft++; else darkRight++;
+    if (y >= eyeTop && y <= eyeBottom) { if (x < cx) eyeLeft++; else eyeRight++; }
+    if (y >= mouthTop && y <= mouthBottom && x >= mouthLeft && x <= mouthRight) mouthCenter++;
   }
   const darkTotal = darkLeft + darkRight;
   const darkBalance = darkTotal ? 2 * Math.min(darkLeft, darkRight) / darkTotal : 0;
   const darkPresence = Math.min(1, darkTotal / 32);
-  const featureScore = darkBalance * darkPresence;
-  const faceConfidence = frontal * .40 + coverage * .16 + balance * .10 + clarity * .16 + featureScore * .18;
-  return { score: frontal * .48 + coverage * .20 + balance * .10 + clarity * .10 + featureScore * .12, frontal, cx: cx / sw * width, cy: cy / sh * height, faceWidth, faceHeight, colorPixels: warmCount, clarity, featureScore, faceConfidence };
+  const eyeTotal = eyeLeft + eyeRight;
+  const eyePair = eyeTotal ? 2 * Math.min(eyeLeft, eyeRight) / eyeTotal : 0;
+  const eyePresence = Math.min(1, eyeTotal / 28);
+  const mouthPresence = Math.min(1, mouthCenter / 18);
+  // A frontal face should show a balanced pair of eye-area details and a
+  // central lower facial detail, not just a large warm-colored blob.
+  const featureScore = clamp(darkBalance * darkPresence * .35 + eyePair * eyePresence * .45 + mouthPresence * .20, 0, 1);
+  const faceConfidence = frontal * .36 + coverage * .10 + balance * .08 + clarity * .14 + featureScore * .32;
+  return { score: frontal * .42 + coverage * .14 + balance * .08 + clarity * .10 + featureScore * .26, frontal, cx: cx / sw * width, cy: cy / sh * height, faceWidth, faceHeight, colorPixels: warmCount, clarity, featureScore, faceConfidence };
 }
 
 async function snapshot(asset: Asset): Promise<FaceCandidate[]> {
