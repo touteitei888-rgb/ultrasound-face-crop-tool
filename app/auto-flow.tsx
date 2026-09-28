@@ -237,7 +237,7 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
   const strongJpgs = jpgs.filter(candidate => candidate.faceConfidence >= .50 && candidate.clarity >= .10);
   const strongGifs = gifs.filter(candidate => candidate.faceConfidence >= .44 && candidate.clarity >= .10);
   const widthGap = (a: FaceCandidate, b: FaceCandidate) => Math.abs(Math.log((a.faceWidth * a.image.naturalWidth) / (b.faceWidth * b.image.naturalWidth)));
-  const pairValue = (a: FaceCandidate, b: FaceCandidate) => (a.score + b.score) / 2 + (a.clarity + b.clarity) * .12 - widthGap(a, b) * .22;
+  const pairValue = (a: FaceCandidate, b: FaceCandidate) => (a.score + b.score) / 2 + (a.clarity + b.clarity) * .16 + (a.frontal + b.frontal) * .14 + (a.featureScore + b.featureScore) * .16 - widthGap(a, b) * .22;
   const bestPair = (pool: FaceCandidate[]) => {
     if (pool.length <= 1) return pool.slice();
     let best: typeof eligible | null = null, value = -Infinity;
@@ -256,11 +256,13 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
     const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
-    return /^\.?jpe?g$/i.test(candidate.ext) && candidate.colorPixels >= 80 && candidate.faceWidth >= 12 && candidate.score >= .20 && candidate.frontal >= .10 && candidate.clarity >= .03 && faceWidthPixels >= Math.max(70, width * .08) && maxCropWidth >= 120;
+    // A JPG is preferred only when it actually resembles a frontal face. A
+    // warm-colored scan by itself is not enough; otherwise arms and placenta
+    // images win simply because they contain more orange pixels.
+    return /^\.?jpe?g$/i.test(candidate.ext) && candidate.colorPixels >= 80 && candidate.faceWidth >= 18 && candidate.score >= .34 && candidate.frontal >= .30 && candidate.featureScore >= .05 && candidate.faceConfidence >= .36 && candidate.clarity >= .06 && faceWidthPixels >= Math.max(90, width * .10) && maxCropWidth >= 120;
   }).map(candidate => {
-    // A color JPG is the preferred source. Its whole-frame layout is stable,
-    // so use one standard face scale instead of letting a noisy mask turn it
-    // into a close-up or rejecting it altogether.
+    // A qualified JPG is the preferred source. Keep its detected facial
+    // position and only normalize the margin around that face.
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     return {
       ...candidate,
@@ -269,29 +271,22 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
       // consistent margin instead of including the arm/placenta region.
       cx: candidate.cx > width * .28 && candidate.cx < width * .72 ? candidate.cx : width * .47,
       cy: candidate.cy > height * .24 && candidate.cy < height * .68 ? candidate.cy : height * .45,
-      // Leave enough room to keep the complete face and a modest border for
-      // later layout; the previous smaller box clipped the forehead/chin.
       faceWidth: clamp(candidate.faceWidth, 44, 48),
       faceHeight: clamp(candidate.faceHeight, 44, 48),
-      frontal: Math.max(candidate.frontal, .28),
-      score: Math.max(candidate.score, .42),
-      faceConfidence: Math.max(candidate.faceConfidence, .32),
     };
   });
   if (jpgFallback.length) return bestPair(jpgFallback);
   if (strongGifs.length) return bestPair(strongGifs);
   if (other.length) return bestPair(other);
-  // Some valid 3D ultrasound faces have soft edges or only a brief frontal
-  // view, so keep a controlled rescue path instead of returning nothing. It
-  // still excludes monochrome scans and frames that cannot fit the common
-  // album face scale.
-  const rescue = candidates.filter(candidate => {
+  // If no JPG passes the face test, use GIF frames converted to standalone
+  // JPGs. The same frontal-face and clarity gates apply to GIFs.
+  const gifFallback = candidates.filter(candidate => {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
     const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
-    return !/^\.?jpe?g$/i.test(candidate.ext) && candidate.score >= .38 && candidate.frontal >= .28 && candidate.clarity >= .06 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(100, width * .14) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .74;
+    return /^\.?gif$/i.test(candidate.ext) && candidate.score >= .34 && candidate.frontal >= .30 && candidate.featureScore >= .05 && candidate.faceConfidence >= .36 && candidate.clarity >= .08 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(100, width * .14) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .74;
   });
-  if (rescue.length) return bestPair(rescue);
+  if (gifFallback.length) return bestPair(gifFallback);
   // Do not export a clearly non-face JPG just to fill the second slot.
   return [];
 }
