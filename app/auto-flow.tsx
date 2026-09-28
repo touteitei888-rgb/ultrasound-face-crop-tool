@@ -232,7 +232,22 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
     const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
-    return /^\.?jpe?g$/i.test(candidate.ext) && candidate.colorPixels >= 80 && candidate.faceWidth >= 18 && candidate.score >= .30 && candidate.frontal >= .20 && candidate.faceConfidence >= .28 && candidate.clarity >= .04 && faceWidthPixels >= Math.max(90, width * .10) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .80;
+    return /^\.?jpe?g$/i.test(candidate.ext) && candidate.colorPixels >= 80 && candidate.faceWidth >= 12 && candidate.score >= .20 && candidate.frontal >= .10 && candidate.clarity >= .03 && faceWidthPixels >= Math.max(70, width * .08) && maxCropWidth >= 120;
+  }).map(candidate => {
+    // A color JPG is the preferred source. Its whole-frame layout is stable,
+    // so use one standard face scale instead of letting a noisy mask turn it
+    // into a close-up or rejecting it altogether.
+    const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
+    return {
+      ...candidate,
+      cx: candidate.cx > width * .24 && candidate.cx < width * .76 ? candidate.cx : width * .52,
+      cy: candidate.cy > height * .22 && candidate.cy < height * .66 ? candidate.cy : height * .42,
+      faceWidth: 160 * .30,
+      faceHeight: 160 * .30,
+      frontal: Math.max(candidate.frontal, .28),
+      score: Math.max(candidate.score, .42),
+      faceConfidence: Math.max(candidate.faceConfidence, .32),
+    };
   });
   if (jpgFallback.length) return bestPair(jpgFallback);
   if (strongGifs.length) return bestPair(strongGifs);
@@ -329,7 +344,7 @@ async function runPhoto(file: File | undefined, manualCode: string, manualName: 
   const selected = chooseFaceCandidates(candidates);
   if (!selected.length) throw new Error("没有找到能完整显示小朋友人脸的彩色影像；黑白平扫图或角度不合适的图片已跳过。");
   const crops: Crop[] = [];
-  const commonWidth = Math.floor(Math.min(...selected.map(targetCropWidthFor)) / 3) * 3;
+  const commonWidth = Math.floor(Math.min(...selected.map(candidate => Math.min(targetCropWidthFor(candidate), maxCropWidthFor(candidate)))) / 3) * 3;
   if (commonWidth < 120) throw new Error("合格正脸的可用范围太小，无法生成统一大小的相册照片。");
   for (const candidate of selected) crops.push(await crop(candidate, commonWidth));
   setStatus("正脸截图已生成，正在保存到本机…");
