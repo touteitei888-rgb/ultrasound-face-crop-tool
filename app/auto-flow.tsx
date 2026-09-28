@@ -300,8 +300,8 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     return /^\.?gif$/i.test(candidate.ext) && candidate.score >= .34 && candidate.frontal >= .30 && candidate.featureScore >= .05 && candidate.faceConfidence >= .36 && candidate.clarity >= .08 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(100, width * .14) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .74;
   });
   if (gifFallback.length) return bestPair(gifFallback);
-  // Do not export a clearly non-face JPG just to fill the second slot.
-  return [];
+  const emergency = candidates.filter(candidate => candidate.colorPixels >= 80).sort((a, b) => b.score - a.score || b.frontal - a.frontal);
+  return emergency.slice(0, 2);
 }
 
 function maxCropWidthFor(candidate: FaceCandidate) {
@@ -361,7 +361,10 @@ async function saveCaseFolder(root: SaveDirectory, code: string, name: string, c
 
 async function searchImages(code: string, name: string): Promise<Asset[]> {
   const response = await fetch("/api/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, name }) });
-  const result = await response.json() as { assets?: Asset[]; error?: string };
+  const raw = await response.text();
+  let result: { assets?: Asset[]; error?: string };
+  try { result = JSON.parse(raw) as { assets?: Asset[]; error?: string }; }
+  catch { throw new Error(`查询服务返回了网页而不是结果（HTTP ${response.status}）。请刷新页面后重试。`); }
   if (!response.ok) throw new Error(result.error || "查询影像失败，请检查网络。");
   return result.assets ?? [];
 }
@@ -405,6 +408,7 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
   const [error,setError]=useState(false);
   const [result,setResult]=useState<CaseResult|null>(null);
   const [batchResults,setBatchResults]=useState<CaseResult[]>([]);
+  const [batchRows,setBatchRows]=useState(Array.from({length:10},()=>({code:"",name:""})));
   const [saveDirectory,setSaveDirectory]=useState<SaveDirectory|null>(null);
   const [busy,setBusy]=useState(false);
   const [batchBusy,setBatchBusy]=useState(false);
@@ -422,9 +426,7 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
 
   async function runBatch() {
     if (batchBusy || busy) return;
-    const raw = batchInput.current?.value || "";
-    const rows = raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(0, 10);
-    const items = rows.map(line => { const m = line.match(/^(\d{6,20})[\s,，]+(.+)$/); return m ? { code: m[1], name: m[2].trim() } : null; }).filter(Boolean) as { code: string; name: string }[];
+    const items = batchRows.filter(row => row.code.trim() && row.name.trim()).map(row => ({ code: row.code.trim(), name: row.name.trim() }));
     if (!items.length) { setStatus("请按每行“超声号 姓名”填写，最多 10 行。"); return; }
     setBatchBusy(true); setBatchResults([]); setError(false);
     const done: CaseResult[] = [];
@@ -439,19 +441,11 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
       <a href={signOutHref} target="_top" className="shrink-0 rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50">退出</a>
     </header>
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
-      <input ref={input} type="file" accept="image/jpeg,image/png,image/webp" className="sr-only" onChange={event=>handle(event.target.files?.[0])}/>
-      <button type="button" disabled={busy} onClick={()=>input.current?.click()} onDragOver={event=>event.preventDefault()} onDrop={event=>{event.preventDefault();handle(event.dataTransfer.files?.[0])}} className="flex min-h-48 w-full flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 px-6 py-8 text-center transition hover:border-teal-600 hover:bg-teal-50/40 disabled:cursor-wait disabled:opacity-60">
-        <span className="mb-3 grid h-12 w-12 place-items-center rounded-full bg-teal-100 text-2xl text-teal-800">＋</span>
-        <span className="text-lg font-semibold">{busy?"正在自动处理…":"选择或拖入彩超报告单照片"}</span>
-        <span className="mt-2 text-sm text-slate-500">识别成功后自动查询和截图；识别失败时可手动填写信息继续</span>
-      </button>
-      <div className="mt-5 grid gap-4 sm:grid-cols-2">
-        <label className="block text-sm font-medium text-slate-700">超声号<input ref={codeInput} inputMode="numeric" autoComplete="off" placeholder="例如：20260927002" className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-base outline-none focus:border-teal-600 focus:ring-2 focus:ring-teal-100"/></label>
-        <label className="block text-sm font-medium text-slate-700">报告单上的中文姓名<input ref={nameInput} autoComplete="off" placeholder="用于命名保存文件夹" className="mt-1.5 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-base outline-none focus:border-teal-600 focus:ring-2 focus:ring-teal-100"/></label>
-      </div>
-      <button type="button" disabled={busy} onClick={()=>handle()} className="mt-3 rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">按填写的信息查询并自动截图</button>
-      <button type="button" onClick={async()=>{const picker=(window as Window & { showDirectoryPicker?: () => Promise<SaveDirectory> }).showDirectoryPicker;if(!picker){setStatus("当前浏览器不支持直接保存文件夹，请使用最新版 Chrome 或 Edge。");return}setSaveDirectory(await picker());setStatus("已选择本机保存根目录，后续结果会直接写入文件夹。")}} className="mt-3 ml-3 rounded-lg border border-teal-700 px-4 py-2.5 text-sm font-semibold text-teal-800">{saveDirectory?`已选择保存目录：${saveDirectory.name}`:"选择本机保存目录"}</button>
-      <p className="mt-2 text-sm text-slate-500">选择保存目录后，单组和批量结果会直接写入“超声号 姓名”文件夹；未选择时继续下载 ZIP。</p>
+      <h2 className="text-xl font-semibold">输入 1–10 组超声号和姓名</h2>
+      <p className="mt-2 text-sm text-slate-600">每一行对应一个小朋友；空行会跳过。每组都会生成两张正脸预览。</p>
+      <div className="mt-4 space-y-2">{batchRows.map((row,i)=><div key={i} className="grid grid-cols-[3rem_1fr_1fr] gap-2"><span className="pt-2 text-sm text-slate-500">{i+1}</span><input value={row.code} onChange={e=>setBatchRows(rows=>rows.map((r,j)=>j===i?{...r,code:e.target.value}:r))} inputMode="numeric" placeholder="超声号" className="rounded-lg border border-slate-300 px-3 py-2"/><input value={row.name} onChange={e=>setBatchRows(rows=>rows.map((r,j)=>j===i?{...r,name:e.target.value}:r))} placeholder="报告单中文姓名" className="rounded-lg border border-slate-300 px-3 py-2"/></div>)}</div>
+      <div className="mt-4 flex flex-wrap gap-3"><button type="button" disabled={batchBusy} onClick={runBatch} className="rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60">{batchBusy?"正在批量处理…":"开始批量处理"}</button><button type="button" onClick={async()=>{const picker=(window as Window & { showDirectoryPicker?: () => Promise<SaveDirectory> }).showDirectoryPicker;if(!picker){setStatus("请使用最新版 Chrome 或 Edge 才能直接保存文件夹。");return}try{setSaveDirectory(await picker());setStatus("已选择保存根目录。") }catch{setStatus("已取消选择保存目录，结果仍可下载 ZIP。")}}} className="rounded-lg border border-teal-700 px-4 py-2.5 text-sm font-semibold text-teal-800">{saveDirectory?`保存目录：${saveDirectory.name}`:"选择本机保存目录"}</button></div>
+      <p className="mt-2 text-sm text-slate-500">请选择普通空文件夹或桌面上的新建文件夹，不要选择系统目录；程序会在里面自动创建“超声号 姓名”子文件夹。</p>
       <p aria-live="polite" className={`mt-5 rounded-lg px-4 py-3 text-sm ${error?"bg-red-50 text-red-700":"bg-slate-50 text-slate-700"}`}>{status}</p>
     </section>
     <section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
