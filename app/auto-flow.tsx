@@ -190,11 +190,17 @@ async function snapshot(asset: Asset): Promise<FaceCandidate[]> {
 }
 
 function chooseFaceCandidates(candidates: FaceCandidate[]) {
+  const targetFaceRatio = .56;
   const structural = candidates.filter(candidate => {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
     const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
-    return candidate.score >= .50 && candidate.frontal >= .40 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(120, width * .16) && maxCropWidth >= 120;
+    // Reject frames whose face is already too close to the edges to make a
+    // normal album portrait. They are the source of the “big head” result:
+    // there is not enough surrounding image to keep the face at a consistent
+    // size in the final 3:4 crop.
+    const canUseAlbumScale = faceWidthPixels / maxCropWidth <= targetFaceRatio;
+    return candidate.score >= .50 && candidate.frontal >= .40 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(120, width * .16) && maxCropWidth >= 120 && canUseAlbumScale;
   });
   const bestClarity = structural.reduce((best, candidate) => Math.max(best, candidate.clarity), 0);
   const clarityFloor = bestClarity ? Math.max(.10, bestClarity * .58) : 0;
@@ -245,20 +251,27 @@ function maxCropWidthFor(candidate: FaceCandidate) {
   return Math.floor(Math.min(width, (safeBottom - safeTop) * .75, safeRight - safeLeft) / 3) * 3;
 }
 
-async function crop(candidate: FaceCandidate, commonWidth?: number): Promise<Crop> {
+function targetCropWidthFor(candidate: FaceCandidate) {
+  const faceWidthPixels = candidate.faceWidth * candidate.image.naturalWidth / 160;
+  return Math.floor(faceWidthPixels / .56 / 3) * 3;
+}
+
+async function crop(candidate: FaceCandidate, commonWidth: number): Promise<Crop> {
   const image = candidate.image, width = image.naturalWidth, height = image.naturalHeight;
   const safeTop = Math.ceil(height * .14), safeBottom = Math.floor(height * .96), safeLeft = Math.floor(width * .10), safeRight = Math.ceil(width * .98);
   const maxCropWidth = Math.floor(Math.min(width, (safeBottom - safeTop) * .75, safeRight - safeLeft) / 3) * 3;
-  const targetWidth = candidate.faceWidth * width / 160 / .84;
-  const cropWidth = commonWidth || Math.floor(Math.min(targetWidth, maxCropWidth) / 3) * 3;
+  // The source crop width varies with the detected face, but every result is
+  // rendered to the same output width. This keeps the baby's face the same
+  // size across the two album images instead of letting one become a close-up.
+  const cropWidth = Math.min(targetCropWidthFor(candidate), maxCropWidth);
   const cropHeight = cropWidth * 4 / 3;
   if (cropWidth < 3) throw new Error("影像分辨率不足，无法裁成 3:4。");
   const cx = clamp(candidate.cx, safeLeft + cropWidth / 2, safeRight - cropWidth / 2);
   const top = Math.round(clamp(candidate.cy - cropHeight * .38, safeTop, safeBottom - cropHeight));
   const left = Math.round(clamp(cx - cropWidth / 2, safeLeft, safeRight - cropWidth));
-  const canvas = document.createElement("canvas"); canvas.width = cropWidth; canvas.height = cropHeight;
+  const canvas = document.createElement("canvas"); canvas.width = commonWidth; canvas.height = commonWidth * 4 / 3;
   const ctx = canvas.getContext("2d"); if (!ctx) throw new Error("无法生成截图。");
-  ctx.drawImage(image, left, top, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+  ctx.drawImage(image, left, top, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
   const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error("PNG 编码失败。")), "image/png"));
   return { dataUrl: canvas.toDataURL("image/png"), width: cropWidth, height: cropHeight, bytes: blob.size };
 }
@@ -309,7 +322,8 @@ async function runPhoto(file: File | undefined, manualCode: string, manualName: 
   const selected = chooseFaceCandidates(candidates);
   if (!selected.length) throw new Error("没有找到能完整显示小朋友人脸的彩色影像；黑白平扫图或角度不合适的图片已跳过。");
   const crops: Crop[] = [];
-  const commonWidth = selected.length > 1 ? Math.min(...selected.map(maxCropWidthFor)) : undefined;
+  const commonWidth = Math.floor(Math.min(...selected.map(targetCropWidthFor)) / 3) * 3;
+  if (commonWidth < 120) throw new Error("合格正脸的可用范围太小，无法生成统一大小的相册照片。");
   for (const candidate of selected) crops.push(await crop(candidate, commonWidth));
   setStatus("正脸截图已生成，正在保存到本机…");
   await downloadZip(code, name, crops);
