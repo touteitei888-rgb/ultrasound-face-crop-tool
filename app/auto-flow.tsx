@@ -54,9 +54,10 @@ async function decodeGifFrames(asset: Asset): Promise<Array<{ image: HTMLImageEl
 
   const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height;
   const ctx = canvas.getContext("2d"); if (!ctx) throw new Error("无法合成 GIF 影像帧。");
-  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, width, height);
   const images: Array<{ image: HTMLImageElement; frameIndex: number }> = [];
-  const step = Math.max(1, Math.ceil(frames.length / 24));
+  const step = Math.max(1, Math.ceil(frames.length / 48));
 
   for (let index = 0; index < frames.length; index++) {
     const frame = frames[index] as {
@@ -67,12 +68,23 @@ async function decodeGifFrames(asset: Asset): Promise<Array<{ image: HTMLImageEl
     const before = frame.disposalType === 3 ? ctx.getImageData(0, 0, width, height) : null;
     const patch = ctx.createImageData(frame.dims.width, frame.dims.height);
     patch.data.set(frame.patch);
-    ctx.putImageData(patch, frame.dims.left, frame.dims.top);
+    // GIF frames usually contain only a small rectangle. Draw the patch through
+    // an offscreen canvas so transparent pixels preserve the previous frame
+    // instead of erasing it and creating white/fragmented holes.
+    const patchCanvas = document.createElement("canvas");
+    patchCanvas.width = frame.dims.width; patchCanvas.height = frame.dims.height;
+    const patchCtx = patchCanvas.getContext("2d");
+    if (!patchCtx) throw new Error("无法读取 GIF 局部帧。");
+    patchCtx.putImageData(patch, 0, 0);
+    ctx.drawImage(patchCanvas, frame.dims.left, frame.dims.top);
     if (index % step === 0 || index === frames.length - 1) {
       images.push({ image: await loadImage(canvas.toDataURL("image/png")), frameIndex: index });
     }
 
-    if (frame.disposalType === 2) ctx.clearRect(frame.dims.left, frame.dims.top, frame.dims.width, frame.dims.height);
+    if (frame.disposalType === 2) {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(frame.dims.left, frame.dims.top, frame.dims.width, frame.dims.height);
+    }
     else if (frame.disposalType === 3 && before) ctx.putImageData(before, 0, 0);
   }
   return images;
@@ -85,13 +97,25 @@ function analyze(image: HTMLImageElement) {
   if (!ctx) throw new Error("无法分析影像。");
   ctx.drawImage(image, 0, 0, sw, sh);
   const pixels = ctx.getImageData(0, 0, sw, sh).data, mask = new Uint8Array(sw * sh), seen = new Uint8Array(sw * sh), queue = new Int32Array(sw * sh);
+  let edgeEnergy = 0, edgeSamples = 0;
+  const grayAt = (x: number, y: number) => {
+    const i = (y * sw + x) * 4;
+    return pixels[i] * .299 + pixels[i + 1] * .587 + pixels[i + 2] * .114;
+  };
+  for (let y = 1; y < sh - 1; y++) for (let x = 1; x < sw - 1; x++) {
+    const center = grayAt(x, y);
+    const laplacian = 4 * center - grayAt(x - 1, y) - grayAt(x + 1, y) - grayAt(x, y - 1) - grayAt(x, y + 1);
+    edgeEnergy += laplacian * laplacian; edgeSamples++;
+  }
+  const edgeRms = edgeSamples ? Math.sqrt(edgeEnergy / edgeSamples) : 0;
+  const clarity = clamp((edgeRms - 5) / 34, 0, 1);
   const left = Math.floor(sw * .08), right = Math.ceil(sw * .99), top = Math.floor(sh * .12), bottom = Math.ceil(sh * .98);
   let warmCount = 0;
   for (let y = top; y < bottom; y++) for (let x = left; x < right; x++) {
     const i = (y * sw + x) * 4, r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
     if (r > 48 && g > 28 && b > 10 && r > g * 1.06 && g > b * 1.02 && r - b > 18) { mask[y * sw + x] = 1; warmCount++; }
   }
-  const empty = { score: 0, frontal: 0, cx: width * .5, cy: height * .42, faceWidth: 0, faceHeight: 0, colorPixels: warmCount };
+  const empty = { score: 0, frontal: 0, cx: width * .5, cy: height * .42, faceWidth: 0, faceHeight: 0, colorPixels: warmCount, clarity };
   if (warmCount < 80) return empty;
   let largest: { count: number; points: Int32Array; minX: number; maxX: number; minY: number; maxY: number } | null = null;
   for (let seed = 0; seed < mask.length; seed++) {
@@ -128,7 +152,7 @@ function analyze(image: HTMLImageElement) {
   const frontal = leftCount + rightCount ? 2 * both / (leftCount + rightCount) : 0;
   const balance = leftCount + rightCount ? 2 * Math.min(leftCount, rightCount) / (leftCount + rightCount) : 0;
   const coverage = rows ? rowCount / rows : 0;
-  return { score: frontal * .60 + coverage * .25 + balance * .15, frontal, cx: cx / sw * width, cy: cy / sh * height, faceWidth, faceHeight, colorPixels: warmCount };
+  return { score: frontal * .54 + coverage * .22 + balance * .14 + clarity * .10, frontal, cx: cx / sw * width, cy: cy / sh * height, faceWidth, faceHeight, colorPixels: warmCount, clarity };
 }
 
 async function snapshot(asset: Asset): Promise<FaceCandidate[]> {
@@ -145,17 +169,20 @@ async function snapshot(asset: Asset): Promise<FaceCandidate[]> {
 }
 
 function chooseFaceCandidates(candidates: FaceCandidate[]) {
-  const eligible = candidates.filter(candidate => {
+  const structural = candidates.filter(candidate => {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
     const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
-    return candidate.score >= .55 && candidate.frontal >= .40 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(120, width * .16);
+    return candidate.score >= .50 && candidate.frontal >= .40 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(120, width * .16) && maxCropWidth >= 120;
   });
+  const bestClarity = structural.reduce((best, candidate) => Math.max(best, candidate.clarity), 0);
+  const clarityFloor = bestClarity ? Math.max(.10, bestClarity * .58) : 0;
+  const eligible = structural.filter(candidate => candidate.clarity >= clarityFloor);
   const jpgs = eligible.filter(candidate => /^\.?jpe?g$/i.test(candidate.ext));
   const gifs = eligible.filter(candidate => /^\.?gif$/i.test(candidate.ext));
   const other = eligible.filter(candidate => !/^\.?jpe?g$/i.test(candidate.ext) && !/^\.?gif$/i.test(candidate.ext));
   const widthGap = (a: FaceCandidate, b: FaceCandidate) => Math.abs(Math.log((a.faceWidth * a.image.naturalWidth) / (b.faceWidth * b.image.naturalWidth)));
-  const pairValue = (a: FaceCandidate, b: FaceCandidate) => (a.score + b.score) / 2 - widthGap(a, b) * .22;
+  const pairValue = (a: FaceCandidate, b: FaceCandidate) => (a.score + b.score) / 2 + (a.clarity + b.clarity) * .12 - widthGap(a, b) * .22;
   const bestPair = (pool: FaceCandidate[]) => {
     if (pool.length <= 1) return pool.slice();
     let best: typeof eligible | null = null, value = -Infinity;
