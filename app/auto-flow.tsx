@@ -32,6 +32,9 @@ function parseReport(text: string) {
 }
 
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+// Keep a little more surrounding image than the old close-up crop, while
+// using this same face-to-frame ratio for every exported album image.
+const ALBUM_FACE_RATIO = .68;
 
 function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -190,7 +193,6 @@ async function snapshot(asset: Asset): Promise<FaceCandidate[]> {
 }
 
 function chooseFaceCandidates(candidates: FaceCandidate[]) {
-  const targetFaceRatio = .56;
   const structural = candidates.filter(candidate => {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
@@ -199,7 +201,7 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     // normal album portrait. They are the source of the “big head” result:
     // there is not enough surrounding image to keep the face at a consistent
     // size in the final 3:4 crop.
-    const canUseAlbumScale = faceWidthPixels / maxCropWidth <= targetFaceRatio;
+    const canUseAlbumScale = faceWidthPixels / maxCropWidth <= ALBUM_FACE_RATIO;
     return candidate.score >= .50 && candidate.frontal >= .40 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(120, width * .16) && maxCropWidth >= 120 && canUseAlbumScale;
   });
   const bestClarity = structural.reduce((best, candidate) => Math.max(best, candidate.clarity), 0);
@@ -241,6 +243,17 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
   }
   if (strongGifs.length) return bestPair(strongGifs);
   if (other.length) return bestPair(other);
+  // Some valid 3D ultrasound faces have soft edges or only a brief frontal
+  // view, so keep a controlled rescue path instead of returning nothing. It
+  // still excludes monochrome scans and frames that cannot fit the common
+  // album face scale.
+  const rescue = candidates.filter(candidate => {
+    const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
+    const faceWidthPixels = candidate.faceWidth * width / 160;
+    const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
+    return candidate.score >= .38 && candidate.frontal >= .28 && candidate.clarity >= .06 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(100, width * .14) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .74;
+  });
+  if (rescue.length) return bestPair(rescue);
   // Do not export a clearly non-face JPG just to fill the second slot.
   return [];
 }
@@ -253,7 +266,7 @@ function maxCropWidthFor(candidate: FaceCandidate) {
 
 function targetCropWidthFor(candidate: FaceCandidate) {
   const faceWidthPixels = candidate.faceWidth * candidate.image.naturalWidth / 160;
-  return Math.floor(faceWidthPixels / .56 / 3) * 3;
+  return Math.floor(faceWidthPixels / ALBUM_FACE_RATIO / 3) * 3;
 }
 
 async function crop(candidate: FaceCandidate, commonWidth: number): Promise<Crop> {
