@@ -245,8 +245,10 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
       // consistent margin instead of including the arm/placenta region.
       cx: candidate.cx > width * .28 && candidate.cx < width * .72 ? candidate.cx : width * .47,
       cy: candidate.cy > height * .24 && candidate.cy < height * .68 ? candidate.cy : height * .45,
-      faceWidth: clamp(candidate.faceWidth, 34, 40),
-      faceHeight: clamp(candidate.faceHeight, 34, 40),
+      // Leave enough room to keep the complete face and a modest border for
+      // later layout; the previous smaller box clipped the forehead/chin.
+      faceWidth: clamp(candidate.faceWidth, 44, 48),
+      faceHeight: clamp(candidate.faceHeight, 44, 48),
       frontal: Math.max(candidate.frontal, .28),
       score: Math.max(candidate.score, .42),
       faceConfidence: Math.max(candidate.faceConfidence, .32),
