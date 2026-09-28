@@ -57,7 +57,9 @@ async function decodeGifFrames(asset: Asset): Promise<Array<{ image: HTMLImageEl
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, width, height);
   const images: Array<{ image: HTMLImageElement; frameIndex: number }> = [];
-  const step = Math.max(1, Math.ceil(frames.length / 48));
+  // Match the manual Convertio workflow: evaluate every GIF frame, not a
+  // sparse sample, so a short clear moment is never skipped.
+  const step = 1;
 
   for (let index = 0; index < frames.length; index++) {
     const frame = frames[index] as {
@@ -78,7 +80,10 @@ async function decodeGifFrames(asset: Asset): Promise<Array<{ image: HTMLImageEl
     patchCtx.putImageData(patch, 0, 0);
     ctx.drawImage(patchCanvas, frame.dims.left, frame.dims.top);
     if (index % step === 0 || index === frames.length - 1) {
-      images.push({ image: await loadImage(canvas.toDataURL("image/png")), frameIndex: index });
+      // Flatten each composited frame to a standalone JPG, just like the
+      // manual conversion workflow. This also removes transparent GIF pixels
+      // before the normal still-image face analysis runs.
+      images.push({ image: await loadImage(canvas.toDataURL("image/jpeg", .96)), frameIndex: index });
     }
 
     if (frame.disposalType === 2) {
@@ -197,7 +202,7 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
   const jpgs = eligible.filter(candidate => /^\.?jpe?g$/i.test(candidate.ext));
   const gifs = eligible.filter(candidate => /^\.?gif$/i.test(candidate.ext));
   const other = eligible.filter(candidate => !/^\.?jpe?g$/i.test(candidate.ext) && !/^\.?gif$/i.test(candidate.ext));
-  const strongJpgs = jpgs.filter(candidate => candidate.faceConfidence >= .44 && candidate.clarity >= .10);
+  const strongJpgs = jpgs.filter(candidate => candidate.faceConfidence >= .50 && candidate.clarity >= .10);
   const strongGifs = gifs.filter(candidate => candidate.faceConfidence >= .44 && candidate.clarity >= .10);
   const widthGap = (a: FaceCandidate, b: FaceCandidate) => Math.abs(Math.log((a.faceWidth * a.image.naturalWidth) / (b.faceWidth * b.image.naturalWidth)));
   const pairValue = (a: FaceCandidate, b: FaceCandidate) => (a.score + b.score) / 2 + (a.clarity + b.clarity) * .12 - widthGap(a, b) * .22;
@@ -298,7 +303,7 @@ async function runPhoto(file: File | undefined, manualCode: string, manualName: 
   setStatus(file ? `已识别/填写 ${code}，正在查询影像…` : `正在按超声号 ${code} 查询影像…`);
   const assets = await searchImages(code, name);
   if (!assets.length) throw new Error("没有找到这个超声号的影像，请检查报告单或稍后重试。");
-  setStatus(`找到 ${assets.length} 张影像，正在自动选正脸并裁切…`);
+  setStatus(`找到 ${assets.length} 张影像，正在逐帧转换 JPG 并筛选清晰正脸…`);
   const candidates: FaceCandidate[] = [];
   for (const asset of assets) { try { candidates.push(...await snapshot(asset)); } catch { /* Skip unreadable images */ } }
   const selected = chooseFaceCandidates(candidates);
