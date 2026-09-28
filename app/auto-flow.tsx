@@ -1,5 +1,6 @@
 "use client";
 
+import { decompressFrames, parseGIF } from "gifuct-js";
 import { useRef, useState } from "react";
 
 type Asset = { index: number; mime: string; ext: string; bytes: string };
@@ -32,11 +33,70 @@ function parseReport(text: string) {
 }
 
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+// Keep a little more surrounding image than the old close-up crop, while
+// using this same face-to-frame ratio for every exported album image.
+const ALBUM_FACE_RATIO = .68;
 
 function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image(); image.onload = () => resolve(image); image.onerror = reject; image.src = src;
   });
+}
+
+function decodeBytes(base64: string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function decodeGifFrames(asset: Asset): Promise<Array<{ image: HTMLImageElement; frameIndex: number }>> {
+  const parsed = parseGIF(decodeBytes(asset.bytes));
+  const frames = decompressFrames(parsed, true);
+  const width = parsed.lsd.width, height = parsed.lsd.height;
+  if (!width || !height || !frames.length) throw new Error("GIF 没有可读取的影像帧。");
+
+  const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height;
+  const ctx = canvas.getContext("2d"); if (!ctx) throw new Error("无法合成 GIF 影像帧。");
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, width, height);
+  const images: Array<{ image: HTMLImageElement; frameIndex: number }> = [];
+  // Match the manual Convertio workflow: evaluate every GIF frame, not a
+  // sparse sample, so a short clear moment is never skipped.
+  const step = 1;
+
+  for (let index = 0; index < frames.length; index++) {
+    const frame = frames[index] as {
+      dims: { left: number; top: number; width: number; height: number };
+      patch: Uint8ClampedArray;
+      disposalType?: number;
+    };
+    const before = frame.disposalType === 3 ? ctx.getImageData(0, 0, width, height) : null;
+    const patch = ctx.createImageData(frame.dims.width, frame.dims.height);
+    patch.data.set(frame.patch);
+    // GIF frames usually contain only a small rectangle. Draw the patch through
+    // an offscreen canvas so transparent pixels preserve the previous frame
+    // instead of erasing it and creating white/fragmented holes.
+    const patchCanvas = document.createElement("canvas");
+    patchCanvas.width = frame.dims.width; patchCanvas.height = frame.dims.height;
+    const patchCtx = patchCanvas.getContext("2d");
+    if (!patchCtx) throw new Error("无法读取 GIF 局部帧。");
+    patchCtx.putImageData(patch, 0, 0);
+    ctx.drawImage(patchCanvas, frame.dims.left, frame.dims.top);
+    if (index % step === 0 || index === frames.length - 1) {
+      // Flatten each composited frame to a standalone JPG, just like the
+      // manual conversion workflow. This also removes transparent GIF pixels
+      // before the normal still-image face analysis runs.
+      images.push({ image: await loadImage(canvas.toDataURL("image/jpeg", .96)), frameIndex: index });
+    }
+
+    if (frame.disposalType === 2) {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(frame.dims.left, frame.dims.top, frame.dims.width, frame.dims.height);
+    }
+    else if (frame.disposalType === 3 && before) ctx.putImageData(before, 0, 0);
+  }
+  return images;
 }
 
 function analyze(image: HTMLImageElement) {
@@ -46,13 +106,25 @@ function analyze(image: HTMLImageElement) {
   if (!ctx) throw new Error("无法分析影像。");
   ctx.drawImage(image, 0, 0, sw, sh);
   const pixels = ctx.getImageData(0, 0, sw, sh).data, mask = new Uint8Array(sw * sh), seen = new Uint8Array(sw * sh), queue = new Int32Array(sw * sh);
+  let edgeEnergy = 0, edgeSamples = 0;
+  const grayAt = (x: number, y: number) => {
+    const i = (y * sw + x) * 4;
+    return pixels[i] * .299 + pixels[i + 1] * .587 + pixels[i + 2] * .114;
+  };
+  for (let y = 1; y < sh - 1; y++) for (let x = 1; x < sw - 1; x++) {
+    const center = grayAt(x, y);
+    const laplacian = 4 * center - grayAt(x - 1, y) - grayAt(x + 1, y) - grayAt(x, y - 1) - grayAt(x, y + 1);
+    edgeEnergy += laplacian * laplacian; edgeSamples++;
+  }
+  const edgeRms = edgeSamples ? Math.sqrt(edgeEnergy / edgeSamples) : 0;
+  const clarity = clamp((edgeRms - 5) / 34, 0, 1);
   const left = Math.floor(sw * .08), right = Math.ceil(sw * .99), top = Math.floor(sh * .12), bottom = Math.ceil(sh * .98);
   let warmCount = 0;
   for (let y = top; y < bottom; y++) for (let x = left; x < right; x++) {
     const i = (y * sw + x) * 4, r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
     if (r > 48 && g > 28 && b > 10 && r > g * 1.06 && g > b * 1.02 && r - b > 18) { mask[y * sw + x] = 1; warmCount++; }
   }
-  const empty = { score: 0, frontal: 0, cx: width * .5, cy: height * .42, faceWidth: 0, faceHeight: 0, colorPixels: warmCount };
+  const empty = { score: 0, frontal: 0, cx: width * .5, cy: height * .42, faceWidth: 0, faceHeight: 0, colorPixels: warmCount, clarity, featureScore: 0, faceConfidence: 0 };
   if (warmCount < 80) return empty;
   let largest: { count: number; points: Int32Array; minX: number; maxX: number; minY: number; maxY: number } | null = null;
   for (let seed = 0; seed < mask.length; seed++) {
@@ -76,7 +148,31 @@ function analyze(image: HTMLImageElement) {
     sx += x; sy += y; pixelsInFace++; faceMinX = Math.min(faceMinX, x); faceMaxX = Math.max(faceMaxX, x);
   }
   if (pixelsInFace < 80 || faceMaxX - faceMinX < 18) return empty;
-  const cx = sx / pixelsInFace, cy = sy / pixelsInFace, faceWidth = faceMaxX - faceMinX + 1, faceHeight = faceBottom - largest.minY + 1;
+  // The largest warm component can contain an arm or placenta beside the
+  // face. Find the densest central horizontal window in the upper component
+  // instead of using the whole component centroid as the face position.
+  const rawFaceWidth = faceMaxX - faceMinX + 1;
+  const windowWidth = Math.max(18, Math.round(rawFaceWidth * .62));
+  const columnDensity = new Int32Array(sw);
+  for (const p of largest.points) {
+    const x = p % sw, y = Math.floor(p / sw);
+    if (y <= faceBottom) columnDensity[x]++;
+  }
+  let bestFaceStart = faceMinX, bestFaceDensity = -Infinity;
+  for (let start = faceMinX; start + windowWidth - 1 <= faceMaxX; start++) {
+    let density = 0;
+    for (let x = start; x < start + windowWidth; x++) density += columnDensity[x];
+    if (density > bestFaceDensity) { bestFaceDensity = density; bestFaceStart = start; }
+  }
+  faceMinX = bestFaceStart;
+  faceMaxX = bestFaceStart + windowWidth - 1;
+  let localSx = 0, localSy = 0, localPixels = 0;
+  for (const p of largest.points) {
+    const x = p % sw, y = Math.floor(p / sw);
+    if (y <= faceBottom && x >= faceMinX && x <= faceMaxX) { localSx += x; localSy += y; localPixels++; }
+  }
+  if (localPixels < 40) return empty;
+  const cx = localSx / localPixels, cy = localSy / localPixels, faceWidth = faceMaxX - faceMinX + 1, faceHeight = faceBottom - largest.minY + 1;
   let leftCount = 0, rightCount = 0, both = 0, rowCount = 0, rows = 0;
   for (let y = largest.minY; y <= faceBottom; y++) {
     let rowBoth = 0;
@@ -89,41 +185,71 @@ function analyze(image: HTMLImageElement) {
   const frontal = leftCount + rightCount ? 2 * both / (leftCount + rightCount) : 0;
   const balance = leftCount + rightCount ? 2 * Math.min(leftCount, rightCount) / (leftCount + rightCount) : 0;
   const coverage = rows ? rowCount / rows : 0;
-  return { score: frontal * .60 + coverage * .25 + balance * .15, frontal, cx: cx / sw * width, cy: cy / sh * height, faceWidth, faceHeight, colorPixels: warmCount };
+  let darkLeft = 0, darkRight = 0, eyeLeft = 0, eyeRight = 0, mouthCenter = 0;
+  const featureTop = Math.round(largest.minY + faceHeight * .08), featureBottom = Math.round(largest.minY + faceHeight * .68);
+  const featureLeft = Math.round(faceMinX + faceWidth * .14), featureRight = Math.round(faceMaxX - faceWidth * .14);
+  const eyeTop = Math.round(largest.minY + faceHeight * .18), eyeBottom = Math.round(largest.minY + faceHeight * .52);
+  const mouthTop = Math.round(largest.minY + faceHeight * .52), mouthBottom = Math.round(largest.minY + faceHeight * .82);
+  const mouthLeft = Math.round(faceMinX + faceWidth * .25), mouthRight = Math.round(faceMaxX - faceWidth * .25);
+  for (let y = featureTop; y <= featureBottom; y++) for (let x = featureLeft; x <= featureRight; x++) {
+    const i = (y * sw + x) * 4, luminance = pixels[i] * .299 + pixels[i + 1] * .587 + pixels[i + 2] * .114;
+    if (luminance >= 62) continue;
+    let warmNeighbors = 0;
+    for (let ny = Math.max(0, y - 2); ny <= Math.min(sh - 1, y + 2); ny++) for (let nx = Math.max(0, x - 2); nx <= Math.min(sw - 1, x + 2); nx++) warmNeighbors += largestMask[ny * sw + nx];
+    if (warmNeighbors < 4) continue;
+    if (x < cx) darkLeft++; else darkRight++;
+    if (y >= eyeTop && y <= eyeBottom) { if (x < cx) eyeLeft++; else eyeRight++; }
+    if (y >= mouthTop && y <= mouthBottom && x >= mouthLeft && x <= mouthRight) mouthCenter++;
+  }
+  const darkTotal = darkLeft + darkRight;
+  const darkBalance = darkTotal ? 2 * Math.min(darkLeft, darkRight) / darkTotal : 0;
+  const darkPresence = Math.min(1, darkTotal / 32);
+  const eyeTotal = eyeLeft + eyeRight;
+  const eyePair = eyeTotal ? 2 * Math.min(eyeLeft, eyeRight) / eyeTotal : 0;
+  const eyePresence = Math.min(1, eyeTotal / 28);
+  const mouthPresence = Math.min(1, mouthCenter / 18);
+  // A frontal face should show a balanced pair of eye-area details and a
+  // central lower facial detail, not just a large warm-colored blob.
+  const featureScore = clamp(darkBalance * darkPresence * .35 + eyePair * eyePresence * .45 + mouthPresence * .20, 0, 1);
+  const faceConfidence = frontal * .36 + coverage * .10 + balance * .08 + clarity * .14 + featureScore * .32;
+  return { score: frontal * .42 + coverage * .14 + balance * .08 + clarity * .10 + featureScore * .26, frontal, cx: cx / sw * width, cy: cy / sh * height, faceWidth, faceHeight, colorPixels: warmCount, clarity, featureScore, faceConfidence };
 }
 
 async function snapshot(asset: Asset): Promise<FaceCandidate[]> {
-  const image = await loadImage(`data:${asset.mime};base64,${asset.bytes}`);
-  const freeze = async () => {
-    const canvas = document.createElement("canvas"); canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
-    const ctx = canvas.getContext("2d"); if (!ctx) throw new Error("无法读取影像画面。");
-    ctx.drawImage(image, 0, 0); return loadImage(canvas.toDataURL("image/png"));
-  };
   if (/^\.?gif$/i.test(asset.ext)) {
-    const frames: FaceCandidate[] = [];
-    for (let i = 0; i < 12; i++) {
-      await new Promise(resolve => window.setTimeout(resolve, 120));
-      const frozen = await freeze(), result = analyze(frozen);
-      frames.push({ ...result, image: frozen, score: result.score * .82 + Math.min(1, Math.sqrt(image.naturalWidth * image.naturalHeight / (1024 * 768))) * .18, ext: asset.ext, asset, frameIndex: i });
-    }
-    return frames;
+    const images = await decodeGifFrames(asset);
+    return images.map(({ image, frameIndex }) => {
+      const result = analyze(image);
+      return { ...result, image, score: result.score * .82 + Math.min(1, Math.sqrt(image.naturalWidth * image.naturalHeight / (1024 * 768))) * .18, ext: asset.ext, asset, frameIndex };
+    });
   }
+  const image = await loadImage(`data:${asset.mime};base64,${asset.bytes}`);
   const result = analyze(image);
   return [{ ...result, image, score: result.score * .82 + Math.min(1, Math.sqrt(image.naturalWidth * image.naturalHeight / (1024 * 768))) * .18, ext: asset.ext, asset, frameIndex: 0 }];
 }
 
 function chooseFaceCandidates(candidates: FaceCandidate[]) {
-  const eligible = candidates.filter(candidate => {
+  const structural = candidates.filter(candidate => {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
     const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
-    return candidate.score >= .55 && candidate.frontal >= .40 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(120, width * .16);
+    // Reject frames whose face is already too close to the edges to make a
+    // normal album portrait. They are the source of the “big head” result:
+    // there is not enough surrounding image to keep the face at a consistent
+    // size in the final 3:4 crop.
+    const canUseAlbumScale = faceWidthPixels / maxCropWidth <= ALBUM_FACE_RATIO;
+    return candidate.score >= .50 && candidate.frontal >= .40 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(120, width * .16) && maxCropWidth >= 120 && canUseAlbumScale;
   });
+  const bestClarity = structural.reduce((best, candidate) => Math.max(best, candidate.clarity), 0);
+  const clarityFloor = bestClarity ? Math.max(.10, bestClarity * .58) : 0;
+  const eligible = structural.filter(candidate => candidate.clarity >= clarityFloor);
   const jpgs = eligible.filter(candidate => /^\.?jpe?g$/i.test(candidate.ext));
   const gifs = eligible.filter(candidate => /^\.?gif$/i.test(candidate.ext));
   const other = eligible.filter(candidate => !/^\.?jpe?g$/i.test(candidate.ext) && !/^\.?gif$/i.test(candidate.ext));
+  const strongJpgs = jpgs.filter(candidate => candidate.faceConfidence >= .50 && candidate.clarity >= .10);
+  const strongGifs = gifs.filter(candidate => candidate.faceConfidence >= .44 && candidate.clarity >= .10);
   const widthGap = (a: FaceCandidate, b: FaceCandidate) => Math.abs(Math.log((a.faceWidth * a.image.naturalWidth) / (b.faceWidth * b.image.naturalWidth)));
-  const pairValue = (a: FaceCandidate, b: FaceCandidate) => (a.score + b.score) / 2 - widthGap(a, b) * .22;
+  const pairValue = (a: FaceCandidate, b: FaceCandidate) => (a.score + b.score) / 2 + (a.clarity + b.clarity) * .16 + (a.frontal + b.frontal) * .14 + (a.featureScore + b.featureScore) * .16 - widthGap(a, b) * .22;
   const bestPair = (pool: FaceCandidate[]) => {
     if (pool.length <= 1) return pool.slice();
     let best: typeof eligible | null = null, value = -Infinity;
@@ -135,20 +261,46 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     }
     return best || [pool.slice().sort((a, b) => b.score - a.score)[0]];
   };
-  if (jpgs.length >= 2) {
-    const jpgPair = bestPair(jpgs);
-    if (jpgPair.length === 2) return jpgPair;
-    const supplements = gifs.length ? gifs : other, primary = jpgPair[0];
-    const supplement = supplements.reduce((best, candidate) => pairValue(primary, candidate) > pairValue(primary, best) ? candidate : best, supplements[0]);
-    return [primary, supplement];
-  }
-  if (jpgs.length === 1) {
-    const supplements = gifs.length ? gifs : other;
-    if (!supplements.length) return jpgs;
-    const supplement = supplements.reduce((best, candidate) => pairValue(jpgs[0], candidate) > pairValue(jpgs[0], best) ? candidate : best, supplements[0]);
-    return [jpgs[0], supplement];
-  }
-  return bestPair(gifs.length ? gifs : other);
+  // JPG is always the first choice. Do not add a GIF beside a usable JPG:
+  // GIF is only a fallback for cases where all JPGs are unusable.
+  if (strongJpgs.length) return bestPair(strongJpgs);
+  const jpgFallback = candidates.filter(candidate => {
+    const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
+    const faceWidthPixels = candidate.faceWidth * width / 160;
+    const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
+    // A JPG is preferred only when it actually resembles a frontal face. A
+    // warm-colored scan by itself is not enough; otherwise arms and placenta
+    // images win simply because they contain more orange pixels.
+    return /^\.?jpe?g$/i.test(candidate.ext) && candidate.colorPixels >= 80 && candidate.faceWidth >= 18 && candidate.score >= .34 && candidate.frontal >= .30 && candidate.featureScore >= .05 && candidate.faceConfidence >= .36 && candidate.clarity >= .06 && faceWidthPixels >= Math.max(90, width * .10) && maxCropWidth >= 120;
+  }).map(candidate => {
+    // A qualified JPG is the preferred source. Keep its detected facial
+    // position and only normalize the margin around that face.
+    const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
+    return {
+      ...candidate,
+      // The raw JPG contains the complete ultrasound layout. Keep the detected
+      // facial position when it is plausible, then give the face only a small
+      // consistent margin instead of including the arm/placenta region.
+      cx: candidate.cx > width * .28 && candidate.cx < width * .72 ? candidate.cx : width * .47,
+      cy: candidate.cy > height * .24 && candidate.cy < height * .68 ? candidate.cy : height * .45,
+      faceWidth: clamp(candidate.faceWidth, 44, 48),
+      faceHeight: clamp(candidate.faceHeight, 44, 48),
+    };
+  });
+  if (jpgFallback.length) return bestPair(jpgFallback);
+  if (strongGifs.length) return bestPair(strongGifs);
+  if (other.length) return bestPair(other);
+  // If no JPG passes the face test, use GIF frames converted to standalone
+  // JPGs. The same frontal-face and clarity gates apply to GIFs.
+  const gifFallback = candidates.filter(candidate => {
+    const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
+    const faceWidthPixels = candidate.faceWidth * width / 160;
+    const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
+    return /^\.?gif$/i.test(candidate.ext) && candidate.score >= .34 && candidate.frontal >= .30 && candidate.featureScore >= .05 && candidate.faceConfidence >= .36 && candidate.clarity >= .08 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(100, width * .14) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .74;
+  });
+  if (gifFallback.length) return bestPair(gifFallback);
+  // Do not export a clearly non-face JPG just to fill the second slot.
+  return [];
 }
 
 function maxCropWidthFor(candidate: FaceCandidate) {
@@ -157,20 +309,27 @@ function maxCropWidthFor(candidate: FaceCandidate) {
   return Math.floor(Math.min(width, (safeBottom - safeTop) * .75, safeRight - safeLeft) / 3) * 3;
 }
 
-async function crop(candidate: FaceCandidate, commonWidth?: number): Promise<Crop> {
+function targetCropWidthFor(candidate: FaceCandidate) {
+  const faceWidthPixels = candidate.faceWidth * candidate.image.naturalWidth / 160;
+  return Math.floor(faceWidthPixels / ALBUM_FACE_RATIO / 3) * 3;
+}
+
+async function crop(candidate: FaceCandidate, commonWidth: number): Promise<Crop> {
   const image = candidate.image, width = image.naturalWidth, height = image.naturalHeight;
   const safeTop = Math.ceil(height * .14), safeBottom = Math.floor(height * .96), safeLeft = Math.floor(width * .10), safeRight = Math.ceil(width * .98);
   const maxCropWidth = Math.floor(Math.min(width, (safeBottom - safeTop) * .75, safeRight - safeLeft) / 3) * 3;
-  const targetWidth = candidate.faceWidth * width / 160 / .84;
-  const cropWidth = commonWidth || Math.floor(Math.min(targetWidth, maxCropWidth) / 3) * 3;
+  // The source crop width varies with the detected face, but every result is
+  // rendered to the same output width. This keeps the baby's face the same
+  // size across the two album images instead of letting one become a close-up.
+  const cropWidth = Math.min(targetCropWidthFor(candidate), maxCropWidth);
   const cropHeight = cropWidth * 4 / 3;
   if (cropWidth < 3) throw new Error("影像分辨率不足，无法裁成 3:4。");
   const cx = clamp(candidate.cx, safeLeft + cropWidth / 2, safeRight - cropWidth / 2);
   const top = Math.round(clamp(candidate.cy - cropHeight * .38, safeTop, safeBottom - cropHeight));
   const left = Math.round(clamp(cx - cropWidth / 2, safeLeft, safeRight - cropWidth));
-  const canvas = document.createElement("canvas"); canvas.width = cropWidth; canvas.height = cropHeight;
+  const canvas = document.createElement("canvas"); canvas.width = commonWidth; canvas.height = commonWidth * 4 / 3;
   const ctx = canvas.getContext("2d"); if (!ctx) throw new Error("无法生成截图。");
-  ctx.drawImage(image, left, top, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+  ctx.drawImage(image, left, top, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
   const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error("PNG 编码失败。")), "image/png"));
   return { dataUrl: canvas.toDataURL("image/png"), width: cropWidth, height: cropHeight, bytes: blob.size };
 }
@@ -214,13 +373,14 @@ async function runPhoto(file: File | undefined, manualCode: string, manualName: 
   setStatus(file ? `已识别/填写 ${code}，正在查询影像…` : `正在按超声号 ${code} 查询影像…`);
   const assets = await searchImages(code, name);
   if (!assets.length) throw new Error("没有找到这个超声号的影像，请检查报告单或稍后重试。");
-  setStatus(`找到 ${assets.length} 张影像，正在自动选正脸并裁切…`);
+  setStatus(`找到 ${assets.length} 张影像，先筛选原始 JPG；只有 JPG 不可用时才逐帧转换 GIF…`);
   const candidates: FaceCandidate[] = [];
   for (const asset of assets) { try { candidates.push(...await snapshot(asset)); } catch { /* Skip unreadable images */ } }
   const selected = chooseFaceCandidates(candidates);
   if (!selected.length) throw new Error("没有找到能完整显示小朋友人脸的彩色影像；黑白平扫图或角度不合适的图片已跳过。");
   const crops: Crop[] = [];
-  const commonWidth = selected.length > 1 ? Math.min(...selected.map(maxCropWidthFor)) : undefined;
+  const commonWidth = Math.floor(Math.min(...selected.map(candidate => Math.min(targetCropWidthFor(candidate), maxCropWidthFor(candidate)))) / 3) * 3;
+  if (commonWidth < 120) throw new Error("合格正脸的可用范围太小，无法生成统一大小的相册照片。");
   for (const candidate of selected) crops.push(await crop(candidate, commonWidth));
   setStatus("正脸截图已生成，正在保存到本机…");
   await downloadZip(code, name, crops);
