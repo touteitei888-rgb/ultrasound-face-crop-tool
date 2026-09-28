@@ -84,7 +84,7 @@ export async function POST(request: Request) {
 
   try {
     const api = new URL(API_URL);
-    api.search = new URLSearchParams({ QueryCode: code, QueryType: "4" });
+    api.search = new URLSearchParams({ QueryCode: code, QueryType: "4" }).toString();
     const response = await fetch(api, {
       headers: { "User-Agent": "Mozilla/5.0", Referer: SITE_REFERRER },
       signal: AbortSignal.timeout(30000),

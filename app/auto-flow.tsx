@@ -1,5 +1,6 @@
 "use client";
 
+import { decompressFrames, parseGIF } from "gifuct-js";
 import { useRef, useState } from "react";
 
 type Asset = { index: number; mime: string; ext: string; bytes: string };
@@ -36,6 +37,45 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image(); image.onload = () => resolve(image); image.onerror = reject; image.src = src;
   });
+}
+
+function decodeBytes(base64: string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function decodeGifFrames(asset: Asset): Promise<Array<{ image: HTMLImageElement; frameIndex: number }>> {
+  const parsed = parseGIF(decodeBytes(asset.bytes));
+  const frames = decompressFrames(parsed, true);
+  const width = parsed.lsd.width, height = parsed.lsd.height;
+  if (!width || !height || !frames.length) throw new Error("GIF 没有可读取的影像帧。");
+
+  const canvas = document.createElement("canvas"); canvas.width = width; canvas.height = height;
+  const ctx = canvas.getContext("2d"); if (!ctx) throw new Error("无法合成 GIF 影像帧。");
+  ctx.clearRect(0, 0, width, height);
+  const images: Array<{ image: HTMLImageElement; frameIndex: number }> = [];
+  const step = Math.max(1, Math.ceil(frames.length / 24));
+
+  for (let index = 0; index < frames.length; index++) {
+    const frame = frames[index] as {
+      dims: { left: number; top: number; width: number; height: number };
+      patch: Uint8ClampedArray;
+      disposalType?: number;
+    };
+    const before = frame.disposalType === 3 ? ctx.getImageData(0, 0, width, height) : null;
+    const patch = ctx.createImageData(frame.dims.width, frame.dims.height);
+    patch.data.set(frame.patch);
+    ctx.putImageData(patch, frame.dims.left, frame.dims.top);
+    if (index % step === 0 || index === frames.length - 1) {
+      images.push({ image: await loadImage(canvas.toDataURL("image/png")), frameIndex: index });
+    }
+
+    if (frame.disposalType === 2) ctx.clearRect(frame.dims.left, frame.dims.top, frame.dims.width, frame.dims.height);
+    else if (frame.disposalType === 3 && before) ctx.putImageData(before, 0, 0);
+  }
+  return images;
 }
 
 function analyze(image: HTMLImageElement) {
@@ -92,21 +132,14 @@ function analyze(image: HTMLImageElement) {
 }
 
 async function snapshot(asset: Asset): Promise<FaceCandidate[]> {
-  const image = await loadImage(`data:${asset.mime};base64,${asset.bytes}`);
-  const freeze = async () => {
-    const canvas = document.createElement("canvas"); canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
-    const ctx = canvas.getContext("2d"); if (!ctx) throw new Error("无法读取影像画面。");
-    ctx.drawImage(image, 0, 0); return loadImage(canvas.toDataURL("image/png"));
-  };
   if (/^\.?gif$/i.test(asset.ext)) {
-    const frames: FaceCandidate[] = [];
-    for (let i = 0; i < 12; i++) {
-      await new Promise(resolve => window.setTimeout(resolve, 120));
-      const frozen = await freeze(), result = analyze(frozen);
-      frames.push({ ...result, image: frozen, score: result.score * .82 + Math.min(1, Math.sqrt(image.naturalWidth * image.naturalHeight / (1024 * 768))) * .18, ext: asset.ext, asset, frameIndex: i });
-    }
-    return frames;
+    const images = await decodeGifFrames(asset);
+    return images.map(({ image, frameIndex }) => {
+      const result = analyze(image);
+      return { ...result, image, score: result.score * .82 + Math.min(1, Math.sqrt(image.naturalWidth * image.naturalHeight / (1024 * 768))) * .18, ext: asset.ext, asset, frameIndex };
+    });
   }
+  const image = await loadImage(`data:${asset.mime};base64,${asset.bytes}`);
   const result = analyze(image);
   return [{ ...result, image, score: result.score * .82 + Math.min(1, Math.sqrt(image.naturalWidth * image.naturalHeight / (1024 * 768))) * .18, ext: asset.ext, asset, frameIndex: 0 }];
 }
@@ -144,7 +177,9 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
   if (jpgs.length === 1) {
     const supplements = gifs.length ? gifs : other;
     if (!supplements.length) return jpgs;
-    const supplement = supplements.reduce((best, candidate) => pairValue(jpgs[0], candidate) > pairValue(jpgs[0], best) ? candidate : best, supplements[0]);
+    const supplement = supplements
+      .slice()
+      .sort((a, b) => pairValue(jpgs[0], b) - pairValue(jpgs[0], a))[0];
     return [jpgs[0], supplement];
   }
   return bestPair(gifs.length ? gifs : other);
