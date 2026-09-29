@@ -147,7 +147,11 @@ function analyze(image: HTMLImageElement) {
   }
   if (!largest || largest.count < 80) return empty;
   const largestMask = new Uint8Array(sw * sh); for (const p of largest.points) largestMask[p] = 1;
-  const faceBottom = Math.min(largest.maxY, Math.round(largest.minY + (largest.maxY - largest.minY) * .57));
+  // The jaw/ear line is usually below the eye-and-nose area. The previous
+  // 57% cutoff stopped at the cheeks on several frames, so keep enough of the
+  // upper component to include the whole lower face without taking its feet
+  // or unrelated bottom structures as the face.
+  const faceBottom = Math.min(largest.maxY, Math.round(largest.minY + (largest.maxY - largest.minY) * .74));
   let pixelsInFace = 0, faceMinX = sw, faceMaxX = 0;
   for (const p of largest.points) {
     const x = p % sw, y = Math.floor(p / sw); if (y > faceBottom) continue;
@@ -204,13 +208,16 @@ function analyze(image: HTMLImageElement) {
   }
   faceMinX = bestFaceStart;
   faceMaxX = bestFaceStart + windowWidth - 1;
-  let localSx = 0, localSy = 0, localPixels = 0;
+  let localPixels = 0;
   for (const p of largest.points) {
     const x = p % sw, y = Math.floor(p / sw);
-    if (y <= faceBottom && x >= faceMinX && x <= faceMaxX) { localSx += x; localSy += y; localPixels++; }
+    if (y <= faceBottom && x >= faceMinX && x <= faceMaxX) localPixels++;
   }
   if (localPixels < 40) return empty;
-  const cx = localSx / localPixels, cy = localSy / localPixels, faceWidth = faceMaxX - faceMinX + 1, faceHeight = faceBottom - largest.minY + 1;
+  const faceWidth = faceMaxX - faceMinX + 1, faceHeight = faceBottom - largest.minY + 1;
+  // Anchor the crop to the selected facial window, not to the warm-pixel
+  // centroid, because the centroid is pulled toward a touching arm/placenta.
+  const cx = (faceMinX + faceMaxX) / 2, cy = largest.minY + faceHeight * .46;
   let leftCount = 0, rightCount = 0, both = 0, rowCount = 0, rows = 0;
   for (let y = largest.minY; y <= faceBottom; y++) {
     let rowBoth = 0;
