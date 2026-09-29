@@ -8,6 +8,12 @@ const SITE_REFERRER = "http://yy.tianxihosp.com/";
 
 type HospitalPayload = { success?: boolean; msg?: string; response?: unknown };
 
+const QUERY_RETRY_DELAYS = [1200, 2600, 5000];
+
+function wait(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function safeImageUrl(value: unknown): value is string {
   if (typeof value !== "string") return false;
   try {
@@ -70,6 +76,27 @@ async function fetchImage(url: string, index: number) {
   };
 }
 
+async function queryHospital(api: URL): Promise<HospitalPayload> {
+  for (let attempt = 0; attempt < QUERY_RETRY_DELAYS.length; attempt++) {
+    const response = await fetch(api, {
+      headers: { "User-Agent": "Mozilla/5.0", Referer: SITE_REFERRER },
+      signal: AbortSignal.timeout(30000),
+    });
+    const raw = await response.text();
+    let payload: HospitalPayload = {};
+    try { payload = JSON.parse(raw) as HospitalPayload; } catch { /* handled below */ }
+    const throttled = response.status === 429 || /频繁|过快|限流/.test(payload.msg || "");
+    if (throttled && attempt < QUERY_RETRY_DELAYS.length - 1) {
+      await wait(QUERY_RETRY_DELAYS[attempt]);
+      continue;
+    }
+    if (!response.ok) throw new Error(payload.msg || `医院查询失败（${response.status}）。`);
+    if (!payload.success) throw new Error(payload.msg || "医院查询没有成功。");
+    return payload;
+  }
+  throw new Error("医院查询请求过于频繁，请稍后重试。");
+}
+
 export async function POST(request: Request) {
   const user = await getChatGPTUser();
   if (!user) return Response.json({ error: "请先登录后再使用。" }, { status: 401, headers: { "Cache-Control": "no-store" } });
@@ -85,13 +112,7 @@ export async function POST(request: Request) {
   try {
     const api = new URL(API_URL);
     api.search = new URLSearchParams({ QueryCode: code, QueryType: "4" }).toString();
-    const response = await fetch(api, {
-      headers: { "User-Agent": "Mozilla/5.0", Referer: SITE_REFERRER },
-      signal: AbortSignal.timeout(30000),
-    });
-    if (!response.ok) throw new Error(`医院查询失败（${response.status}）。`);
-    const payload = await response.json() as HospitalPayload;
-    if (!payload.success) throw new Error(payload.msg || "医院查询没有成功。");
+    const payload = await queryHospital(api);
 
     const all = Array.isArray(payload.response) ? payload.response.filter(safeImageUrl) : [];
     const stills = all.filter(url => /\.(jpg|jpeg|png)$/i.test(new URL(url).pathname));

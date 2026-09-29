@@ -8,6 +8,7 @@ type Crop = { dataUrl: string; width: number; height: number; bytes: number };
 type Worker = { recognize: (image: File) => Promise<{ data: { text: string; confidence: number } }>; terminate: () => Promise<void> };
 type FaceCandidate = ReturnType<typeof analyze> & { image: HTMLImageElement; ext: string; asset: Asset; frameIndex: number };
 type CaseResult = { code: string; name: string; crops: Crop[] };
+type BatchFailure = { code: string; name: string; message: string };
 type SaveDirectory = { name: string; queryPermission?: (options?: { mode?: "read" | "readwrite" }) => Promise<PermissionState>; requestPermission?: (options?: { mode?: "read" | "readwrite" }) => Promise<PermissionState>; getDirectoryHandle: (name: string, options?: { create?: boolean }) => Promise<SaveDirectory>; getFileHandle: (name: string, options?: { create?: boolean }) => Promise<{ createWritable: () => Promise<{ write: (data: Uint8Array) => Promise<void>; close: () => Promise<void> }> }>; };
 
 declare global {
@@ -37,6 +38,7 @@ const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(ma
 // Keep a little more surrounding image than the old close-up crop, while
 // using this same face-to-frame ratio for every exported album image.
 const ALBUM_FACE_RATIO = .68;
+const BATCH_QUERY_GAP_MS = 1600;
 
 function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -413,6 +415,7 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
   const [error,setError]=useState(false);
   const [result,setResult]=useState<CaseResult|null>(null);
   const [batchResults,setBatchResults]=useState<CaseResult[]>([]);
+  const [batchFailures,setBatchFailures]=useState<BatchFailure[]>([]);
   const [batchRows,setBatchRows]=useState(Array.from({length:10},()=>({code:"",name:""})));
   const [saveDirectory,setSaveDirectory]=useState<SaveDirectory|null>(null);
   const [busy,setBusy]=useState(false);
@@ -433,11 +436,25 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
     if (batchBusy || busy) return;
     const items = batchRows.filter(row => row.code.trim() && row.name.trim()).map(row => ({ code: row.code.trim(), name: row.name.trim() }));
     if (!items.length) { setStatus("请按每行“超声号 姓名”填写，最多 10 行。"); return; }
-    setBatchBusy(true); setBatchResults([]); setError(false);
+    setBatchBusy(true); setBatchResults([]); setBatchFailures([]); setError(false);
     const done: CaseResult[] = [];
-    try { for (let i = 0; i < items.length; i++) { setStatus(`正在处理第 ${i + 1}/${items.length} 组：${items[i].code}…`); done.push(await runPhoto(undefined, items[i].code, items[i].name, setStatus, saveDirectory??undefined)); setBatchResults([...done]); } setStatus(`批量完成，共处理 ${done.length} 组。`); }
-    catch (reason) { setError(true); setStatus(reason instanceof Error ? reason.message : "批量处理中断。"); }
-    finally { setBatchBusy(false); }
+    const failed: BatchFailure[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      setStatus(`正在处理第 ${i + 1}/${items.length} 组：${item.code}…`);
+      try {
+        done.push(await runPhoto(undefined, item.code, item.name, setStatus, saveDirectory??undefined));
+        setBatchResults([...done]);
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : "本组处理失败。";
+        failed.push({ code: item.code, name: item.name, message });
+        setBatchFailures([...failed]);
+      }
+      if (i < items.length - 1) await new Promise(resolve => setTimeout(resolve, BATCH_QUERY_GAP_MS));
+    }
+    setError(failed.length > 0);
+    setStatus(`批量处理完成：成功 ${done.length} 组，失败 ${failed.length} 组。失败的组不会影响其他组。`);
+    setBatchBusy(false);
   }
 
   return <main className="mx-auto min-h-screen w-full max-w-5xl px-5 py-8 text-slate-900 sm:px-8 sm:py-12">
@@ -458,6 +475,7 @@ export default function AutoFlow({ signOutHref }: { signOutHref: string }) {
       <p className="mt-2 text-sm text-slate-600">每行填写“超声号 姓名”，例如：20260925012 刘佳。每组会单独查询并下载 ZIP，同时保留页面预览。</p>
       <textarea ref={batchInput} rows={6} disabled={batchBusy} placeholder="20260925012 刘佳\n20260927014 赵香雨" className="mt-4 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-base outline-none focus:border-teal-600 focus:ring-2 focus:ring-teal-100" />
       <button type="button" disabled={batchBusy||busy} onClick={runBatch} className="mt-3 rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60">{batchBusy?"正在批量处理…":"开始批量处理"}</button>
+      {batchFailures.length>0&&<div className="mt-6 space-y-2 rounded-xl border border-red-200 bg-red-50 p-4"><h3 className="font-semibold text-red-800">失败的组（其他组仍会继续处理）</h3>{batchFailures.map(item=><p key={item.code} className="text-sm text-red-700">{item.code} · {item.name}：{item.message}</p>)}</div>}
       {batchResults.length>0&&<div className="mt-6 space-y-6">{batchResults.map(item=><article key={item.code} className="rounded-xl border border-slate-200 p-4"><h3 className="font-semibold">{item.code} · {item.name}</h3><div className="mt-3 grid gap-4 sm:grid-cols-2">{item.crops.map((c,i)=><figure key={i} className="overflow-hidden rounded-lg border border-slate-200 bg-black"><img src={c.dataUrl} alt={`${item.code} 自动截图 ${i+1}`} className="aspect-[3/4] w-full object-contain"/><figcaption className="bg-white px-3 py-2 text-xs text-slate-600">截图 {i+1} · {c.width}×{c.height} · {Math.round(c.bytes/1024)} KB</figcaption></figure>)}</div></article>)}</div>}
     </section>
     {result&&<section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
