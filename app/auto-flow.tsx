@@ -37,7 +37,10 @@ function parseReport(text: string) {
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
 // Keep a little more surrounding image than the old close-up crop, while
 // using this same face-to-frame ratio for every exported album image.
-const ALBUM_FACE_RATIO = .68;
+// Keep a useful amount of surrounding ultrasound context. A smaller ratio
+// means the face occupies less of the final frame, which prevents the
+// "big-head" crop and gives the crop planner room to keep the whole face.
+const ALBUM_FACE_RATIO = .56;
 const BATCH_QUERY_GAP_MS = 1600;
 
 function loadImage(src: string): Promise<HTMLImageElement> {
@@ -127,7 +130,7 @@ function analyze(image: HTMLImageElement) {
     const i = (y * sw + x) * 4, r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
     if (r > 48 && g > 28 && b > 10 && r > g * 1.06 && g > b * 1.02 && r - b > 18) { mask[y * sw + x] = 1; warmCount++; }
   }
-  const empty = { score: 0, frontal: 0, cx: width * .5, cy: height * .42, faceWidth: 0, faceHeight: 0, colorPixels: warmCount, clarity, featureScore: 0, faceConfidence: 0 };
+  const empty = { score: 0, frontal: 0, cx: width * .5, cy: height * .42, faceWidth: 0, faceHeight: 0, faceLeft: 0, faceRight: 0, faceTop: 0, faceBottom: 0, colorPixels: warmCount, clarity, featureScore: 0, faceConfidence: 0 };
   if (warmCount < 80) return empty;
   let largest: { count: number; points: Int32Array; minX: number; maxX: number; minY: number; maxY: number } | null = null;
   for (let seed = 0; seed < mask.length; seed++) {
@@ -145,10 +148,10 @@ function analyze(image: HTMLImageElement) {
   if (!largest || largest.count < 80) return empty;
   const largestMask = new Uint8Array(sw * sh); for (const p of largest.points) largestMask[p] = 1;
   const faceBottom = Math.min(largest.maxY, Math.round(largest.minY + (largest.maxY - largest.minY) * .57));
-  let sx = 0, sy = 0, pixelsInFace = 0, faceMinX = sw, faceMaxX = 0;
+  let pixelsInFace = 0, faceMinX = sw, faceMaxX = 0;
   for (const p of largest.points) {
     const x = p % sw, y = Math.floor(p / sw); if (y > faceBottom) continue;
-    sx += x; sy += y; pixelsInFace++; faceMinX = Math.min(faceMinX, x); faceMaxX = Math.max(faceMaxX, x);
+    pixelsInFace++; faceMinX = Math.min(faceMinX, x); faceMaxX = Math.max(faceMaxX, x);
   }
   if (pixelsInFace < 80 || faceMaxX - faceMinX < 18) return empty;
   // The largest warm component can contain an arm or placenta beside the
@@ -215,7 +218,24 @@ function analyze(image: HTMLImageElement) {
   // central lower facial detail, not just a large warm-colored blob.
   const featureScore = clamp(darkBalance * darkPresence * .35 + eyePair * eyePresence * .45 + mouthPresence * .20, 0, 1);
   const faceConfidence = frontal * .36 + coverage * .10 + balance * .08 + clarity * .14 + featureScore * .32;
-  return { score: frontal * .42 + coverage * .14 + balance * .08 + clarity * .10 + featureScore * .26, frontal, cx: cx / sw * width, cy: cy / sh * height, faceWidth, faceHeight, colorPixels: warmCount, clarity, featureScore, faceConfidence };
+  return {
+    score: frontal * .42 + coverage * .14 + balance * .08 + clarity * .10 + featureScore * .26,
+    frontal,
+    cx: cx / sw * width,
+    cy: cy / sh * height,
+    faceWidth,
+    faceHeight,
+    // Retain the detected face box in source-image pixels. The crop planner
+    // uses this box to prove that the face fits before exporting anything.
+    faceLeft: faceMinX / sw * width,
+    faceRight: (faceMaxX + 1) / sw * width,
+    faceTop: largest.minY / sh * height,
+    faceBottom: (faceBottom + 1) / sh * height,
+    colorPixels: warmCount,
+    clarity,
+    featureScore,
+    faceConfidence,
+  };
 }
 
 async function snapshot(asset: Asset): Promise<FaceCandidate[]> {
@@ -231,6 +251,21 @@ async function snapshot(asset: Asset): Promise<FaceCandidate[]> {
   return [{ ...result, image, score: result.score * .82 + Math.min(1, Math.sqrt(image.naturalWidth * image.naturalHeight / (1024 * 768))) * .18, ext: asset.ext, asset, frameIndex: 0 }];
 }
 
+function hasCompleteCropRoom(candidate: FaceCandidate) {
+  const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
+  const faceWidthPixels = candidate.faceWidth * width / 160;
+  const maxCropWidth = maxCropWidthFor(candidate);
+  const cropWidth = Math.min(Math.floor(faceWidthPixels / ALBUM_FACE_RATIO / 3) * 3, maxCropWidth);
+  const cropHeight = cropWidth * 4 / 3;
+  const boxWidth = Math.max(1, candidate.faceRight - candidate.faceLeft);
+  const boxHeight = Math.max(1, candidate.faceBottom - candidate.faceTop);
+  const expandedLeft = candidate.faceLeft - boxWidth * .12;
+  const expandedRight = candidate.faceRight + boxWidth * .12;
+  const expandedTop = candidate.faceTop - boxHeight * .12;
+  const expandedBottom = candidate.faceBottom + boxHeight * .12;
+  return cropWidth >= 120 && cropHeight >= boxHeight && expandedRight - expandedLeft <= cropWidth && expandedBottom - expandedTop <= cropHeight && expandedLeft >= 0 && expandedRight <= width && expandedTop >= 0 && expandedBottom <= height;
+}
+
 function chooseFaceCandidates(candidates: FaceCandidate[]) {
   const structural = candidates.filter(candidate => {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
@@ -241,7 +276,10 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     // there is not enough surrounding image to keep the face at a consistent
     // size in the final 3:4 crop.
     const canUseAlbumScale = faceWidthPixels / maxCropWidth <= ALBUM_FACE_RATIO;
-    return candidate.score >= .50 && candidate.frontal >= .40 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(120, width * .16) && maxCropWidth >= 120 && canUseAlbumScale;
+    // A candidate is only eligible when a 3:4 crop can contain the complete
+    // detected face with a little safety margin. This rejects side faces and
+    // frames where the detector found only a cheek/forehead beside an arm.
+    return candidate.score >= .50 && candidate.frontal >= .40 && candidate.featureScore >= .12 && candidate.faceConfidence >= .46 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(120, width * .16) && maxCropWidth >= 120 && canUseAlbumScale && hasCompleteCropRoom(candidate);
   });
   const bestClarity = structural.reduce((best, candidate) => Math.max(best, candidate.clarity), 0);
   const clarityFloor = bestClarity ? Math.max(.10, bestClarity * .58) : 0;
@@ -249,24 +287,25 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
   const jpgs = eligible.filter(candidate => /^\.?jpe?g$/i.test(candidate.ext));
   const gifs = eligible.filter(candidate => /^\.?gif$/i.test(candidate.ext));
   const other = eligible.filter(candidate => !/^\.?jpe?g$/i.test(candidate.ext) && !/^\.?gif$/i.test(candidate.ext));
-  const strongJpgs = jpgs.filter(candidate => candidate.faceConfidence >= .50 && candidate.clarity >= .10);
-  const strongGifs = gifs.filter(candidate => candidate.faceConfidence >= .44 && candidate.clarity >= .10);
+  const strongJpgs = jpgs.filter(candidate => candidate.faceConfidence >= .50 && candidate.featureScore >= .14 && candidate.clarity >= .10);
+  const strongGifs = gifs.filter(candidate => candidate.faceConfidence >= .48 && candidate.featureScore >= .14 && candidate.clarity >= .10);
   const widthGap = (a: FaceCandidate, b: FaceCandidate) => Math.abs(Math.log((a.faceWidth * a.image.naturalWidth) / (b.faceWidth * b.image.naturalWidth)));
   const pairValue = (a: FaceCandidate, b: FaceCandidate) => (a.score + b.score) / 2 + (a.clarity + b.clarity) * .16 + (a.frontal + b.frontal) * .14 + (a.featureScore + b.featureScore) * .16 - widthGap(a, b) * .22;
   const bestPair = (pool: FaceCandidate[]) => {
-    if (pool.length <= 1) return pool.slice();
-    let best: typeof eligible | null = null, value = -Infinity;
+    if (pool.length <= 1) return [];
+    let best: FaceCandidate[] | null = null, value = -Infinity;
     for (let i = 0; i < pool.length; i++) for (let j = i + 1; j < pool.length; j++) {
       if (pool[i].asset.index === pool[j].asset.index && Math.abs(pool[i].frameIndex - pool[j].frameIndex) < 3) continue;
       if (widthGap(pool[i], pool[j]) > Math.log(1.5)) continue;
       const score = pairValue(pool[i], pool[j]);
       if (score > value) { value = score; best = [pool[i], pool[j]]; }
     }
-    return best || [pool.slice().sort((a, b) => b.score - a.score)[0]];
+    return best || [];
   };
-  // JPG is always the first choice. Do not add a GIF beside a usable JPG:
-  // GIF is only a fallback for cases where all JPGs are unusable.
-  if (strongJpgs.length) return bestPair(strongJpgs);
+  // JPG is always the first choice. If there are two usable JPGs, use those.
+  // If there is only one, a qualified GIF frame may supply the second view;
+  // this preserves the JPG while still enforcing the two-image requirement.
+  if (strongJpgs.length >= 2) return bestPair(strongJpgs);
   const jpgFallback = candidates.filter(candidate => {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
@@ -274,36 +313,34 @@ function chooseFaceCandidates(candidates: FaceCandidate[]) {
     // A JPG is preferred only when it actually resembles a frontal face. A
     // warm-colored scan by itself is not enough; otherwise arms and placenta
     // images win simply because they contain more orange pixels.
-    return /^\.?jpe?g$/i.test(candidate.ext) && candidate.colorPixels >= 80 && candidate.faceWidth >= 18 && candidate.score >= .34 && candidate.frontal >= .30 && candidate.featureScore >= .05 && candidate.faceConfidence >= .36 && candidate.clarity >= .06 && faceWidthPixels >= Math.max(90, width * .10) && maxCropWidth >= 120;
+    return /^\.?jpe?g$/i.test(candidate.ext) && candidate.colorPixels >= 80 && candidate.faceWidth >= 18 && candidate.score >= .42 && candidate.frontal >= .36 && candidate.featureScore >= .10 && candidate.faceConfidence >= .42 && candidate.clarity >= .08 && faceWidthPixels >= Math.max(110, width * .12) && maxCropWidth >= 120 && hasCompleteCropRoom(candidate);
   }).map(candidate => {
     // A qualified JPG is the preferred source. Keep its detected facial
-    // position and only normalize the margin around that face.
-    const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
+    // position; cropPlan will calculate the consistent margin around it.
     return {
       ...candidate,
-      // The raw JPG contains the complete ultrasound layout. Keep the detected
-      // facial position when it is plausible, then give the face only a small
-      // consistent margin instead of including the arm/placenta region.
-      cx: candidate.cx > width * .28 && candidate.cx < width * .72 ? candidate.cx : width * .47,
-      cy: candidate.cy > height * .24 && candidate.cy < height * .68 ? candidate.cy : height * .45,
-      faceWidth: clamp(candidate.faceWidth, 44, 48),
-      faceHeight: clamp(candidate.faceHeight, 44, 48),
+      cx: candidate.cx,
+      cy: candidate.cy,
     };
   });
-  if (jpgFallback.length) return bestPair(jpgFallback);
-  if (strongGifs.length) return bestPair(strongGifs);
-  if (other.length) return bestPair(other);
+  if (jpgFallback.length >= 2) return bestPair(jpgFallback);
+  if (strongJpgs.length === 1 && strongGifs.length) return bestPair([...strongJpgs, ...strongGifs]);
+  if (jpgFallback.length === 1 && strongGifs.length) return bestPair([...jpgFallback, ...strongGifs]);
+  if (strongGifs.length >= 2) return bestPair(strongGifs);
+  if (other.length >= 2) return bestPair(other);
   // If no JPG passes the face test, use GIF frames converted to standalone
   // JPGs. The same frontal-face and clarity gates apply to GIFs.
   const gifFallback = candidates.filter(candidate => {
     const width = candidate.image.naturalWidth, height = candidate.image.naturalHeight;
     const faceWidthPixels = candidate.faceWidth * width / 160;
     const maxCropWidth = Math.floor(Math.min(width, (Math.floor(height * .96) - Math.ceil(height * .14)) * .75, Math.ceil(width * .98) - Math.floor(width * .10)) / 3) * 3;
-    return /^\.?gif$/i.test(candidate.ext) && candidate.score >= .34 && candidate.frontal >= .30 && candidate.featureScore >= .05 && candidate.faceConfidence >= .36 && candidate.clarity >= .08 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(100, width * .14) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .74;
+    return /^\.?gif$/i.test(candidate.ext) && candidate.score >= .42 && candidate.frontal >= .36 && candidate.featureScore >= .10 && candidate.faceConfidence >= .42 && candidate.clarity >= .08 && candidate.colorPixels >= 80 && faceWidthPixels >= Math.max(110, width * .14) && maxCropWidth >= 120 && faceWidthPixels / maxCropWidth <= .72 && hasCompleteCropRoom(candidate);
   });
-  if (gifFallback.length) return bestPair(gifFallback);
-  const emergency = candidates.filter(candidate => candidate.colorPixels >= 80).sort((a, b) => b.score - a.score || b.frontal - a.frontal);
-  return emergency.slice(0, 2);
+  if (gifFallback.length >= 2) return bestPair(gifFallback);
+  // Never manufacture a result from a warm-colored blob. An incomplete face
+  // is worse than a visible failure because it would be saved as a valid baby
+  // album image.
+  return [];
 }
 
 function maxCropWidthFor(candidate: FaceCandidate) {
@@ -317,19 +354,39 @@ function targetCropWidthFor(candidate: FaceCandidate) {
   return Math.floor(faceWidthPixels / ALBUM_FACE_RATIO / 3) * 3;
 }
 
+function cropPlan(candidate: FaceCandidate, cropWidth: number) {
+  const image = candidate.image, width = image.naturalWidth, height = image.naturalHeight;
+  const cropHeight = cropWidth * 4 / 3;
+  const boxWidth = Math.max(1, candidate.faceRight - candidate.faceLeft);
+  const boxHeight = Math.max(1, candidate.faceBottom - candidate.faceTop);
+  const marginX = boxWidth * .12;
+  const marginY = boxHeight * .12;
+  const faceLeft = candidate.faceLeft - marginX;
+  const faceRight = candidate.faceRight + marginX;
+  const faceTop = candidate.faceTop - marginY;
+  const faceBottom = candidate.faceBottom + marginY;
+  const leftMin = Math.max(0, faceRight - cropWidth);
+  const leftMax = Math.min(width - cropWidth, faceLeft);
+  const topMin = Math.max(0, faceBottom - cropHeight);
+  const topMax = Math.min(height - cropHeight, faceTop);
+  if (leftMin > leftMax || topMin > topMax) return null;
+  const left = Math.round(clamp(candidate.cx - cropWidth / 2, leftMin, leftMax));
+  const top = Math.round(clamp(candidate.cy - cropHeight * .38, topMin, topMax));
+  return { left, top, cropHeight };
+}
+
 async function crop(candidate: FaceCandidate, commonWidth: number): Promise<Crop> {
   const image = candidate.image, width = image.naturalWidth, height = image.naturalHeight;
-  const safeTop = Math.ceil(height * .14), safeBottom = Math.floor(height * .96), safeLeft = Math.floor(width * .10), safeRight = Math.ceil(width * .98);
-  const maxCropWidth = Math.floor(Math.min(width, (safeBottom - safeTop) * .75, safeRight - safeLeft) / 3) * 3;
+  const maxCropWidth = Math.floor(Math.min(width, height * .75) / 3) * 3;
   // The source crop width varies with the detected face, but every result is
   // rendered to the same output width. This keeps the baby's face the same
   // size across the two album images instead of letting one become a close-up.
   const cropWidth = Math.min(targetCropWidthFor(candidate), maxCropWidth);
   const cropHeight = cropWidth * 4 / 3;
   if (cropWidth < 3) throw new Error("影像分辨率不足，无法裁成 3:4。");
-  const cx = clamp(candidate.cx, safeLeft + cropWidth / 2, safeRight - cropWidth / 2);
-  const top = Math.round(clamp(candidate.cy - cropHeight * .38, safeTop, safeBottom - cropHeight));
-  const left = Math.round(clamp(cx - cropWidth / 2, safeLeft, safeRight - cropWidth));
+  const plan = cropPlan(candidate, cropWidth);
+  if (!plan) throw new Error("完整人脸周围没有足够的连续影像范围，已跳过该帧。");
+  const { left, top } = plan;
   const canvas = document.createElement("canvas"); canvas.width = commonWidth; canvas.height = commonWidth * 4 / 3;
   const ctx = canvas.getContext("2d"); if (!ctx) throw new Error("无法生成截图。");
   ctx.drawImage(image, left, top, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
@@ -396,9 +453,9 @@ async function runPhoto(file: File | undefined, manualCode: string, manualName: 
   const candidates: FaceCandidate[] = [];
   for (const asset of assets) { try { candidates.push(...await snapshot(asset)); } catch { /* Skip unreadable images */ } }
   const selected = chooseFaceCandidates(candidates);
-  if (!selected.length) throw new Error("没有找到能完整显示小朋友人脸的彩色影像；黑白平扫图或角度不合适的图片已跳过。");
+  if (selected.length !== 2) throw new Error("没有找到两张都能完整显示小朋友正脸的彩色影像；不完整、遮挡或角度不合适的图片已跳过，本组不会生成残缺截图。");
   const crops: Crop[] = [];
-  const commonWidth = Math.floor(Math.min(...selected.map(candidate => Math.min(targetCropWidthFor(candidate), maxCropWidthFor(candidate)))) / 3) * 3;
+  const commonWidth = Math.floor(Math.min(...selected.map(candidate => Math.min(targetCropWidthFor(candidate), Math.floor(Math.min(candidate.image.naturalWidth, candidate.image.naturalHeight * .75) / 3) * 3))) / 3) * 3;
   if (commonWidth < 120) throw new Error("合格正脸的可用范围太小，无法生成统一大小的相册照片。");
   for (const candidate of selected) crops.push(await crop(candidate, commonWidth));
   setStatus("正脸截图已生成，正在保存到本机…");
